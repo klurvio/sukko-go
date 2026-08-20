@@ -1,0 +1,40 @@
+# golangci-lint configuration (v2)
+# https://golangci-lint.run/usage/configuration/
+# Run: golangci-lint run ./...
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  go: "1.23"
+
+linters:
+  # Start from none; enable only what this SDK needs.
+  default: none
+  enable:
+    # Core correctness
+    - errcheck # unchecked errors (constitution §III — no silent failures)
+    - govet
+    - ineffassign
+    - staticcheck # includes gosimple + stylecheck
+    - unused # no dead code (constitution §XI)
+
+    # SDK-relevant additions
+    - bodyclose # HTTP response bodies are closed (REST/SSE/push)
+    - contextcheck # context.Context is threaded correctly
+    - durationcheck # duration multiplication mistakes (backoff/heartbeat)
+    - errorlint # correct %w error wrapping / errors.Is/As usage
+    - gosec # security checks (constitution §IX — redaction, TLS)
+    - misspell
+    - nilerr # returns nil where err != nil
+    - noctx # HTTP requests without a context
+    - prealloc
+    - predeclared
+    - revive
+    - unconvert
+    - unparam
+
+formatters:
+  enable:
+    - gofmt

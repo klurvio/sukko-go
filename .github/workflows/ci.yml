@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_integration:
+        description: "Run the opt-in live-compose integration suite"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: gofmt
+        run: |
+          fmt="$(gofmt -s -l .)"
+          if [ -n "$fmt" ]; then
+            echo "::error::gofmt found unformatted files:"; echo "$fmt"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
+        with:
+          version: v2.12.2
+
+  test:
+    name: test (go${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.23", "1.24", "1.25", "1.26"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go build ./...
+      # -race is REQUIRED: it is the primary enforcement of concurrency safety (constitution §VIII).
+      - run: go test -race ./...
+
+  # Opt-in live-compose smoke — build-tagged integration tests, run only on manual dispatch.
+  # The harness boots the stack with an Enterprise license (cumulative: covers the Pro-gated
+  # publish/SSE and Enterprise-gated push suites) and MESSAGE_BACKEND=kafka (the replay leg needs
+  # pos-recovery, which the Direct backend cannot exercise). See specs NFR-005. The compose boot
+  # and the `integration`-tagged tests land with the implementation.
+  integration:
+    name: live-compose smoke (opt-in)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_integration }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go test -race -tags=integration ./...
