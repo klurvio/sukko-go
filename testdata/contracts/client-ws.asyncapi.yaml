@@ -1,0 +1,1687 @@
+asyncapi: 3.0.0
+
+info:
+  title: Sukko WebSocket Client API
+  version: 1.4.0
+  description: |
+    Real-time WebSocket API for subscribing to chat events and publishing messages.
+
+    ## Connection
+
+    Connect via WebSocket at `wss://{host}/ws` with one of these credential modes:
+
+    | Mode | Credentials | Access Level |
+    |------|-------------|--------------|
+    | **JWT only** | `?token={jwt}` or `Authorization: Bearer {jwt}` | Full access per JWT claims |
+    | **API key only** | `?api_key={key}` or `X-API-Key: {key}` | Public channels only, no publish |
+    | **JWT + API key** | Both (any combination) | Full JWT access; tenants must match |
+    | **None** (auth disabled) | None | All channels, routed to default tenant |
+    | **None** (auth enabled) | None | Rejected (HTTP 401) |
+
+    Query parameters (`token`, `api_key`) take precedence over headers when both are provided.
+
+    ### API Key Escalation
+
+    API-key-only connections can escalate to full JWT access mid-connection by sending an `auth` message with a valid JWT. On success, the connection gains full JWT permissions (user-scoped channels, group-scoped channels, publish access). The JWT's `tenant_id` must match the API key's tenant.
+
+    ## Channel Format
+
+    All channels use explicit tenant-prefixed format: `{tenant}.{suffix}`
+
+    - Minimum 2 dot-separated parts (tenant prefix + at least one suffix segment)
+    - The tenant prefix must match the authenticated tenant (JWT `tenant_id`) or the default tenant (when auth is disabled)
+    - Examples: `sukko.general.messages`, `sukko.support.typing`, `acme.inbox.user123`, `sukko.trades`
+
+    ## Connection Lifecycle
+
+    - **Admission control**: The server may reject WebSocket upgrades under high CPU (>60%), memory pressure, goroutine limits, or per-tenant connection limits.
+    - **Slow client disconnection**: If the server fails to deliver 3 consecutive messages to a client (send buffer full), it disconnects with close code 1008 (Policy Violation).
+    - **Graceful shutdown**: The server sends close code 1001 (Going Away) to all clients before stopping.
+    - **Heartbeat**: Client sends `heartbeat`, server responds with `pong` containing a timestamp.
+
+    ## WebSocket Close Codes
+
+    | Code | Meaning | Trigger |
+    |------|---------|---------|
+    | 1000 | Normal closure | Client or server initiated clean close |
+    | 1001 | Going away | Server shutting down (graceful) |
+    | 1008 | Policy violation | Slow client disconnected after max delivery attempts |
+    | 1011 | Internal error | Unexpected server error |
+    | 4000 | force_disconnect / heartbeat timeout | Direction-dependent: server-sent = operator-initiated force-disconnect via Connections Management API (`DELETE /connections/{connId}`); client-sent = client-initiated close after heartbeat (pong) timeout. Clients MUST use the close direction to disambiguate. |
+
+    ## JWT Claims
+
+    | Field | Type | Description |
+    |-------|------|-------------|
+    | `sub` | string | Principal — user or application identifier |
+    | `tenant_id` | string | Tenant for routing and access control |
+    | `roles` | string[] | Roles for authorization |
+    | `groups` | string[] | Group memberships (for group-scoped channels) |
+    | `scopes` | string[] | Permission scopes |
+    | `attrs` | map[string]string | Custom attributes for placeholder resolution |
+
+    ## Channel Permissions (auth enabled)
+
+    The gateway validates channels in two stages:
+
+    **Stage 1 — Tenant validation (always):**
+    Channel must start with `{tenant_id}.` matching the JWT's `tenant_id` (auth enabled) or the default tenant ID (auth disabled). Channels with the wrong tenant prefix are silently filtered out on subscribe, or rejected with `forbidden` on publish.
+
+    **Stage 2 — Pattern matching (auth enabled only):**
+    The gateway strips the tenant prefix and matches the remaining portion against permission patterns.
+
+    Channel authorization is **provisioning-only**: per-tenant channel rules
+    configured via the provisioning API (streamed to the gateway over gRPC)
+    are the sole authorization source. There is no static gateway pattern
+    configuration and no fallback rule set — a tenant with no rules is denied
+    all subscribes and publishes (deny-all).
+
+    | Rule Field | Format | Example | Behavior |
+    |------------|--------|---------|----------|
+    | `public` | Wildcard glob | `*.messages` | Any authenticated connection can subscribe (matches `general.messages` from `sukko.general.messages`) |
+    | `group_mappings` | Group → patterns | `{"traders": ["*.trade"]}` | Only members of the JWT `groups` claim get the mapped patterns |
+    | `default` | Wildcard glob | `alerts.*` | Fallback tier: applies to JWT-authenticated connections whose groups match no mapping |
+    | `{principal}` placeholder | Inside any pattern | `inbox.{principal}` | Substituted with the JWT subject at match time (`sukko.inbox.user123` requires `sub=user123`) |
+
+    Publish authorization uses the separate publish-side fields
+    (`publish_public`, `publish_group_mappings`, `publish_default`) with the
+    same pattern semantics — rules are side-specific and may be asymmetric.
+    A publish denied by rules receives the standard `FORBIDDEN` error.
+
+    Channels not matching any pattern are denied.
+
+    **API-key-only connections** (no JWT) can only subscribe to public channels — user-scoped and group-scoped patterns require JWT claims, and publish always requires JWT.
+
+    ## Topic Mapping Rules
+
+    Published messages are routed to Kafka topics via **topic routing rules** configured per-tenant through the provisioning API. Each rule maps a channel suffix pattern to one or more Kafka topic suffixes.
+
+    | Field | Description | Example |
+    |-------|-------------|---------|
+    | `pattern` | Channel suffix glob with `*` wildcards | `rooms.*.messages` |
+    | `topics` | Array of Kafka topic suffixes (no wildcards) | `["rooms.messages"]` |
+
+    **Evaluation**: Rules are evaluated in order — **first match wins**. If no rule matches, the publish is rejected.
+
+    **Wildcard syntax**: `*` matches any sequence of characters including dots. For example, `rooms.*.messages` matches both `rooms.general.messages` and `rooms.eng.general.messages`. The `{}` placeholder syntax is NOT supported in routing patterns (it is only used in channel permission patterns).
+
+    **Example rules**:
+    ```json
+    [
+      {"pattern": "*.messages", "topics": ["messages"]},
+      {"pattern": "*.typing", "topics": ["typing"]},
+      {"pattern": "rooms.*.presence", "topics": ["rooms.presence"]}
+    ]
+    ```
+
+    When a client publishes to `sukko.general.messages`, the gateway strips the tenant prefix (`general.messages`), matches against the first rule (`*.messages`), and routes to Kafka topic `sukko.messages` (tenant prefix + first matching topics entry).
+
+    ## Rate Limits and Constraints
+
+    | Constraint | Default | Config Env Var |
+    |------------|---------|----------------|
+    | Publish rate | 10 msg/sec | `GATEWAY_PUBLISH_RATE_LIMIT` |
+    | Publish burst | 100 | `GATEWAY_PUBLISH_BURST` |
+    | Max publish payload | 64KB | `GATEWAY_MAX_PUBLISH_SIZE` |
+    | Send buffer | 512 messages | `WS_CLIENT_SEND_BUFFER_SIZE` |
+    | Slow client max attempts | 3 | `WS_SLOW_CLIENT_MAX_ATTEMPTS` |
+    | Reconnect replay limit | 100 messages | `WS_MAX_REPLAY_MESSAGES` |
+    | Reconnect timeout | 5s | `WS_REPLAY_TIMEOUT` |
+    | Gap notify buffer | 8 notifications | `WS_GAP_NOTIFY_BUFFER_SIZE` |
+    | Live replay rate limit | 1 per 10s per channel | `WS_REPLAY_RATE_LIMIT_INTERVAL` |
+    | Auth refresh rate | 1 per 30s | `GATEWAY_AUTH_REFRESH_RATE_INTERVAL` |
+    | Auth validation timeout | 5s | `GATEWAY_AUTH_VALIDATION_TIMEOUT` |
+    | Min channel parts | 2 | — |
+
+    ## Internal Protocol Note
+
+    With explicit channels, the gateway-to-server protocol uses the same channel format as the client API (`{tenant}.{suffix}`). The gateway validates and filters; it does not transform channel names.
+
+    | Aspect | Client to Gateway | Gateway to Server |
+    |--------|-------------------|-------------------|
+    | Channel format | `{tenant}.{suffix}` | Same (passed through) |
+    | Auth | JWT validated at gateway | Already validated |
+    | Subscribe filtering | Gateway filters unauthorized channels | All channels pre-authorized |
+    | Publish validation | Gateway validates tenant + permissions | Server validates Kafka routing |
+
+  contact:
+    name: Sukko Platform Team
+  license:
+    name: Proprietary
+
+servers:
+  gateway:
+    host: "{host}:{port}"
+    protocol: wss
+    description: Sukko WebSocket Gateway — authenticates connections, validates tenant isolation, and proxies to the internal WebSocket server.
+    security:
+      - $ref: "#/components/securitySchemes/bearerToken"
+      - $ref: "#/components/securitySchemes/queryToken"
+      - $ref: "#/components/securitySchemes/apiKey"
+      - $ref: "#/components/securitySchemes/apiKeyQuery"
+
+channels:
+  clientSend:
+    address: /ws
+    description: >
+      WebSocket endpoint for client-to-server messages.
+      Clients send subscribe, unsubscribe, publish, reconnect, heartbeat, auth, and history messages.
+    messages:
+      subscribe:
+        $ref: "#/components/messages/subscribe"
+      unsubscribe:
+        $ref: "#/components/messages/unsubscribe"
+      publish:
+        $ref: "#/components/messages/publish"
+      reconnect:
+        $ref: "#/components/messages/reconnect"
+      heartbeat:
+        $ref: "#/components/messages/heartbeat"
+      auth:
+        $ref: "#/components/messages/auth"
+      history:
+        $ref: "#/components/messages/history"
+      replay:
+        $ref: "#/components/messages/replay"
+
+  clientReceive:
+    address: /ws
+    description: >
+      WebSocket endpoint for server-to-client messages.
+      Clients receive broadcast messages, acknowledgments, errors, and pong responses.
+    messages:
+      message:
+        $ref: "#/components/messages/message"
+      subscriptionAck:
+        $ref: "#/components/messages/subscriptionAck"
+      unsubscriptionAck:
+        $ref: "#/components/messages/unsubscriptionAck"
+      publishAck:
+        $ref: "#/components/messages/publishAck"
+      publishError:
+        $ref: "#/components/messages/publishError"
+      reconnectAck:
+        $ref: "#/components/messages/reconnectAck"
+      reconnectError:
+        $ref: "#/components/messages/reconnectError"
+      pong:
+        $ref: "#/components/messages/pong"
+      error:
+        $ref: "#/components/messages/error"
+      subscribeError:
+        $ref: "#/components/messages/subscribeError"
+      unsubscribeError:
+        $ref: "#/components/messages/unsubscribeError"
+      authAck:
+        $ref: "#/components/messages/authAck"
+      authError:
+        $ref: "#/components/messages/authError"
+      historyComplete:
+        $ref: "#/components/messages/historyComplete"
+      historyError:
+        $ref: "#/components/messages/historyError"
+      gap:
+        $ref: "#/components/messages/gap"
+      replayMessage:
+        $ref: "#/components/messages/replayMessage"
+      replayComplete:
+        $ref: "#/components/messages/replayComplete"
+
+operations:
+  sendSubscribe:
+    action: send
+    channel:
+      $ref: "#/channels/clientSend"
+    summary: Subscribe to channels
+    description: >
+      Subscribe to one or more channels. Channels use explicit tenant-prefixed format
+      (`{tenant}.{suffix}`). The gateway validates the tenant prefix and,
+      when auth is enabled, filters channels by permission rules. Unauthorized channels
+      are silently dropped.
+    messages:
+      - $ref: "#/channels/clientSend/messages/subscribe"
+
+  sendUnsubscribe:
+    action: send
+    channel:
+      $ref: "#/channels/clientSend"
+    summary: Unsubscribe from channels
+    description: >
+      Unsubscribe from one or more previously subscribed channels.
+      Unsubscribing from non-subscribed channels is harmless (no error).
+    messages:
+      - $ref: "#/channels/clientSend/messages/unsubscribe"
+
+  sendPublish:
+    action: send
+    channel:
+      $ref: "#/channels/clientSend"
+    summary: Publish a message to a channel
+    description: |
+      Publish a message to a single channel. The gateway validates:
+      1. Tenant prefix matches authenticated tenant
+      2. Channel has at least 2 dot-separated parts (tenant prefix + suffix)
+      3. Payload does not exceed 64KB
+      4. Rate limit not exceeded (10 msg/sec, burst 100)
+
+      On success, the message is routed to the corresponding Redpanda topic
+      (`{namespace}.{tenant}.{suffix}`) and a `publish_ack` is returned.
+    messages:
+      - $ref: "#/channels/clientSend/messages/publish"
+
+  sendReconnect:
+    action: send
+    channel:
+      $ref: "#/channels/clientSend"
+    summary: Reconnect and replay missed messages
+    description: >
+      Request replay of missed messages using a persistent client ID and last-known
+      pos values. The server replays up to 100 messages within a 5-second timeout.
+    messages:
+      - $ref: "#/channels/clientSend/messages/reconnect"
+
+  sendHeartbeat:
+    action: send
+    channel:
+      $ref: "#/channels/clientSend"
+    summary: Send a heartbeat
+    description: >
+      Send a heartbeat to keep the connection alive. The server responds with a `pong`
+      message containing the current server timestamp.
+    messages:
+      - $ref: "#/channels/clientSend/messages/heartbeat"
+
+  receiveMessage:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive a broadcast message
+    description: >
+      Receive a broadcast message on a subscribed channel. Messages include a monotonic
+      sequence number for gap detection and a server timestamp in Unix milliseconds.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/message"
+
+  receiveSubscriptionAck:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive subscription acknowledgment
+    messages:
+      - $ref: "#/channels/clientReceive/messages/subscriptionAck"
+
+  receiveUnsubscriptionAck:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive unsubscription acknowledgment
+    messages:
+      - $ref: "#/channels/clientReceive/messages/unsubscriptionAck"
+
+  receivePublishAck:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive publish acknowledgment
+    messages:
+      - $ref: "#/channels/clientReceive/messages/publishAck"
+
+  receivePublishError:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive publish error
+    messages:
+      - $ref: "#/channels/clientReceive/messages/publishError"
+
+  receiveReconnectAck:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive reconnect acknowledgment
+    messages:
+      - $ref: "#/channels/clientReceive/messages/reconnectAck"
+
+  receiveReconnectError:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive reconnect error
+    messages:
+      - $ref: "#/channels/clientReceive/messages/reconnectError"
+
+  receivePong:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive heartbeat response
+    messages:
+      - $ref: "#/channels/clientReceive/messages/pong"
+
+  receiveError:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive a generic error
+    messages:
+      - $ref: "#/channels/clientReceive/messages/error"
+
+  receiveSubscribeError:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive subscribe error
+    description: >
+      Received when a subscribe request has an invalid data format.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/subscribeError"
+
+  receiveUnsubscribeError:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive unsubscribe error
+    description: >
+      Received when an unsubscribe request has an invalid data format.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/unsubscribeError"
+
+  sendAuth:
+    action: send
+    channel:
+      $ref: "#/channels/clientSend"
+    summary: Refresh JWT token or escalate from API-key-only
+    description: |
+      Send a new JWT token to:
+      1. **Refresh** an expiring JWT without disconnecting
+      2. **Escalate** an API-key-only connection to full JWT access
+
+      On success, the server responds with `auth_ack` containing the new expiry.
+      On failure, the server responds with `auth_error`.
+
+      Constraints:
+      - Rate limited to 1 auth refresh per 30 seconds (`GATEWAY_AUTH_REFRESH_RATE_INTERVAL`)
+      - JWT tenant must match the connection's tenant (cannot switch tenants mid-connection)
+      - If the connection has an API key, the JWT tenant must also match the API key's tenant
+      - On successful escalation, previously denied channels are NOT auto-subscribed — client must re-subscribe
+      - On refresh, channels no longer permitted under the new JWT are force-unsubscribed (client receives `unsubscription_ack`)
+    messages:
+      - $ref: "#/channels/clientSend/messages/auth"
+
+  receiveAuthAck:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive auth refresh/escalation acknowledgment
+    description: >
+      Confirms that the auth refresh or escalation was successful.
+      Contains the new token expiration timestamp.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/authAck"
+
+  receiveAuthError:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive auth refresh/escalation error
+    description: >
+      Indicates that the auth refresh or escalation failed.
+      Error codes: invalid_token, token_expired, tenant_mismatch, rate_limited, not_available.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/authError"
+
+  sendHistory:
+    action: send
+    channel:
+      $ref: "#/channels/clientSend"
+    summary: Request historical messages for a channel
+    description: >
+      Request delivery of historical messages for a previously-subscribed channel.
+      The client must be subscribed before sending this request.
+      Requires Pro or higher edition.
+      Responds with zero or more `broadcast` messages (each with `history: true`) followed by a `history_complete` message.
+      On error, responds with a `history_error` message.
+    messages:
+      - $ref: "#/channels/clientSend/messages/history"
+
+  receiveHistoryComplete:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive history delivery completion signal
+    description: >
+      Sent after all historical messages have been delivered for a channel.
+      Historical messages carry `history: true`; live messages do not.
+      After receiving this signal, all subsequent messages on the channel are live.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/historyComplete"
+
+  receiveHistoryError:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive history request error
+    description: >
+      Sent when a history request fails validation or encounters a storage error.
+      Error codes:
+        - `history_disabled`: history feature not enabled on this server (not retriable — feature is off)
+        - `not_available`: Pro or higher edition required, or JWT expired
+        - `history_not_subscribed`: client must subscribe to the channel first
+        - `history_time_range_not_supported`: from_ts/to_ts queries are not supported in v1
+        - `history_invalid_limit`: limit out of range [1, MAX_HISTORY_LIMIT]
+        - `history_in_progress`: history delivery already running for this channel
+        - `history_storage_unavailable`: Valkey temporarily unreachable (retriable — try again after backoff)
+        - `history_invalid_channel`: channel must be in {tenant}.{suffix} format (not retriable — fix the channel name)
+        - `history_invalid_request`: malformed JSON in history request payload (not retriable — fix the request)
+    messages:
+      - $ref: "#/channels/clientReceive/messages/historyError"
+
+  sendReplay:
+    action: send
+    channel:
+      $ref: "#/channels/clientSend"
+    summary: Request live gap recovery replay
+    description: >
+      Client requests replay of missed messages on the existing connection without reconnecting.
+      Used after receiving a gap notification. The server responds with zero or more
+      replay_message envelopes followed by a replay_complete message.
+      The client must be subscribed to the channel before sending a replay request.
+    messages:
+      - $ref: "#/channels/clientSend/messages/replay"
+
+  receiveGap:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive gap notification
+    description: >
+      Server notifies the client that one or more messages were dropped because
+      the client's send buffer was full. Use last_pos as from_pos in a sendReplay
+      request to recover all missed messages. Gap notifications are advisory — clients
+      detect gaps independently via the seq field on messages.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/gap"
+
+  receiveReplayMessage:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive a replayed message during live gap recovery
+    description: >
+      A single message delivered as part of a live replay response. Structured the same
+      as a normal message envelope but with type replay_message. A replay_complete
+      message follows after the last replayed message.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/replayMessage"
+
+  receiveReplayComplete:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive replay completion signal
+    description: >
+      Signals that live replay delivery is finished. messages_replayed is the count of
+      replay_message envelopes delivered (may be 0 if no messages existed in the range).
+      If truncated is true, delivery was cut short by a timeout — the client may need to
+      request another replay with a newer cursor.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/replayComplete"
+
+  receiveReplayError:
+    action: receive
+    channel:
+      $ref: "#/channels/clientReceive"
+    summary: Receive live replay error response
+    description: >
+      Server sends a generic error envelope when a sendReplay request is rejected or fails.
+      The channel field identifies which channel triggered the error.
+      Possible codes: not_subscribed, invalid_request, replay_in_progress,
+      replay_rate_limited, offset_out_of_range, not_available, replay_failed.
+      Parallel to receiveHistoryError for the history handler.
+    messages:
+      - $ref: "#/channels/clientReceive/messages/error"
+
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "Authorization: Bearer {token} header"
+    queryToken:
+      type: httpApiKey
+      in: query
+      name: token
+      description: "?token={jwt} query parameter — takes precedence over Authorization header"
+    apiKey:
+      type: httpApiKey
+      in: header
+      name: X-API-Key
+      description: "X-API-Key header for API key authentication (public channels only, no publish)"
+    apiKeyQuery:
+      type: httpApiKey
+      in: query
+      name: api_key
+      description: "?api_key={key} query parameter — takes precedence over X-API-Key header"
+
+  schemas:
+    ClientMessage:
+      type: object
+      description: Standard envelope for all client-to-server messages.
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          description: Message type identifier.
+          enum:
+            - subscribe
+            - unsubscribe
+            - publish
+            - reconnect
+            - heartbeat
+            - auth
+            - history
+            - replay
+        data:
+          type: object
+          description: Type-specific payload.
+
+    AuthData:
+      type: object
+      description: Payload for auth refresh/escalation messages.
+      required:
+        - token
+      properties:
+        token:
+          type: string
+          description: JWT token for refresh or escalation from API-key-only to full JWT access.
+          examples:
+            - "eyJhbGciOiJFZDI1NTE5IiwidHlwIjoiSldUIn0..."
+
+    AuthAck:
+      type: object
+      description: Acknowledgment after a successful auth refresh or escalation.
+      required:
+        - type
+        - data
+      properties:
+        type:
+          type: string
+          const: auth_ack
+        data:
+          type: object
+          required:
+            - exp
+          properties:
+            exp:
+              type: integer
+              format: int64
+              description: New token expiration in Unix seconds. 0 if token has no expiry.
+      examples:
+        - type: auth_ack
+          data:
+            exp: 1706003600
+
+    AuthError:
+      type: object
+      description: Error response for a failed auth refresh or escalation.
+      required:
+        - type
+        - data
+      properties:
+        type:
+          type: string
+          const: auth_error
+        data:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code.
+              enum:
+                - invalid_token
+                - token_expired
+                - tenant_mismatch
+                - rate_limited
+                - not_available
+            message:
+              type: string
+              description: Human-readable error description.
+      examples:
+        - type: auth_error
+          data:
+            code: tenant_mismatch
+            message: "Token tenant does not match connection tenant"
+
+    SubscribeData:
+      type: object
+      description: |
+        Payload for subscribe messages. Two mutually exclusive modes:
+        - **Multi-channel subscribe** (no history): populate `channels`.
+        - **Subscribe-with-history** (single channel): populate `channel` and `history`.
+      properties:
+        channels:
+          type: array
+          items:
+            type: string
+          description: "Channels to subscribe to (multi-channel mode). Format: {tenant}.{suffix}"
+          examples:
+            - ["sukko.general.messages", "sukko.support.typing"]
+        channel:
+          type: string
+          description: "Single channel to subscribe to (subscribe-with-history mode). Format: {tenant}.{suffix}"
+          examples:
+            - "sukko.BTC.trade"
+        history:
+          type: object
+          description: >
+            If present, triggers subscribe-with-history after the subscription is established.
+            Requires Pro or higher edition and `WS_HISTORY_ENABLED=true`.
+          required:
+            - limit
+          properties:
+            limit:
+              type: integer
+              minimum: 1
+              description: Number of historical messages to retrieve (1 to WS_HISTORY_MAX_LIMIT).
+              examples:
+                - 50
+
+    UnsubscribeData:
+      type: object
+      description: Payload for unsubscribe messages.
+      required:
+        - channels
+      properties:
+        channels:
+          type: array
+          items:
+            type: string
+          description: "Channels to unsubscribe from. Format: {tenant}.{suffix}"
+          examples:
+            - ["sukko.general.messages"]
+
+    PublishData:
+      type: object
+      description: Payload for publish messages.
+      required:
+        - channel
+        - data
+      properties:
+        channel:
+          type: string
+          description: "Target channel. Format: {tenant}.{suffix}"
+          examples:
+            - "sukko.general.messages"
+        data:
+          type: object
+          description: Arbitrary JSON payload (max 64KB).
+          examples:
+            - { "text": "Hello everyone!", "sender": "user123" }
+
+    ReconnectData:
+      type: object
+      description: Payload for reconnect messages.
+      required:
+        - client_id
+        - last_pos
+      properties:
+        client_id:
+          type: string
+          description: Persistent client identifier for reconnection.
+          examples:
+            - "abc123"
+        last_pos:
+          type: object
+          additionalProperties:
+            type: string
+          description: >
+            Map of channel name to the last `pos` value received on that channel.
+            Use the `pos` values from live or history messages received on each channel — persist
+            them across disconnections and send them back on reconnect to resume from the correct
+            position. Do NOT construct pos values manually — `pos` is an opaque token whose internal
+            encoding may change between releases. Only use values received from the server.
+          examples:
+            - { "sukko.BTC.trade": "3-100", "sukko.ETH.trade": "5-200" }
+
+    MessageEnvelope:
+      type: object
+      description: Broadcast message envelope sent to subscribed clients.
+      required:
+        - type
+        - seq
+        - ts
+        - channel
+        - data
+      properties:
+        type:
+          type: string
+          const: message
+          description: Always "message" for broadcast messages.
+        seq:
+          type: integer
+          format: int64
+          description: Monotonically increasing sequence number per connection. Starts at 1. Used for gap detection.
+        ts:
+          type: integer
+          format: int64
+          description: Server timestamp in Unix milliseconds.
+        channel:
+          type: string
+          description: "Channel this message was broadcast on. Format: {tenant}.{suffix}"
+          examples:
+            - "sukko.general.messages"
+        data:
+          type: object
+          description: Message payload (schema owned by the publishing service).
+        history:
+          type: boolean
+          description: >
+            Present and `true` when this message is a historical replay (delivered in response to a history
+            or subscribe-with-history request). Absent or `false` for live messages.
+            Clients use this flag to identify historical messages.
+        pos:
+          type: string
+          description: >
+            Encoded Kafka position "(partition+1)-offset" for this message. Present on Kafka-sourced messages:
+            live broadcast messages and history messages stored with an explicit Kafka-coordinate XADD ID.
+            Absent (omitted) for messages from the Direct backend and for history messages
+            stored with auto-assigned Valkey IDs (legacy entries written before Kafka-coordinate XADD was introduced).
+            Clients use this as a durable replay cursor: persist the most recent `pos` per channel and send it
+            back in `last_pos` on reconnect.
+      examples:
+        - type: message
+          seq: 1234
+          ts: 1706000000000
+          channel: "sukko.general.messages"
+          data: { "text": "Hello everyone!", "sender": "user123" }
+          pos: "3-1234"
+        - type: message
+          seq: 1
+          ts: 1706000000000
+          channel: "sukko.BTC.trade"
+          data: { "price": "65432.10" }
+          history: true
+          pos: "1-99"
+
+    SubscriptionAck:
+      type: object
+      description: Acknowledgment after a successful subscribe operation.
+      required:
+        - type
+        - subscribed
+        - count
+      properties:
+        type:
+          type: string
+          const: subscription_ack
+        subscribed:
+          type: array
+          items:
+            type: string
+          description: Channels that were successfully subscribed (with tenant prefix). Channels that were filtered by permissions are not included.
+        count:
+          type: integer
+          description: Total active subscription count for this connection.
+      examples:
+        - type: subscription_ack
+          subscribed: ["sukko.general.messages"]
+          count: 5
+
+    UnsubscriptionAck:
+      type: object
+      description: Acknowledgment after an unsubscribe operation.
+      required:
+        - type
+        - unsubscribed
+      properties:
+        type:
+          type: string
+          const: unsubscription_ack
+        unsubscribed:
+          type: array
+          items:
+            type: string
+          description: Channels that were unsubscribed (with tenant prefix).
+        count:
+          type: integer
+          description: |
+            Total active subscription count for this connection.
+            Typically present for client-initiated unsubscribes; absent for server-forced ones.
+        forced:
+          type: boolean
+          description: |
+            Set to true when channels were force-unsubscribed due to auth refresh or permission change.
+      examples:
+        - type: unsubscription_ack
+          unsubscribed: ["sukko.general.messages"]
+          count: 4
+        - type: unsubscription_ack
+          unsubscribed: ["sukko.general.messages"]
+          forced: true
+
+    PublishAck:
+      type: object
+      description: Acknowledgment after a successful publish.
+      required:
+        - type
+        - channel
+        - status
+      properties:
+        type:
+          type: string
+          const: publish_ack
+        channel:
+          type: string
+          description: Channel the message was published to (with tenant prefix).
+        status:
+          type: string
+          const: accepted
+          description: Always "accepted" on success.
+      examples:
+        - type: publish_ack
+          channel: "sukko.general.messages"
+          status: accepted
+
+    PublishError:
+      type: object
+      description: Error response for a failed publish operation.
+      required:
+        - type
+        - code
+        - message
+      properties:
+        type:
+          type: string
+          const: publish_error
+        code:
+          type: string
+          description: Machine-readable error code.
+          enum:
+            - not_available
+            - invalid_request
+            - invalid_channel
+            - message_too_large
+            - rate_limited
+            - publish_failed
+            - forbidden
+            - topic_not_provisioned
+            - service_unavailable
+            - no_routing_rules
+            - no_matching_route
+        message:
+          type: string
+          description: Human-readable error description.
+      examples:
+        - type: publish_error
+          code: rate_limited
+          message: "Publish rate limit exceeded"
+
+    ReconnectAck:
+      type: object
+      description: Acknowledgment after a successful reconnect with message replay.
+      required:
+        - type
+        - status
+        - messages_replayed
+        - message
+      properties:
+        type:
+          type: string
+          const: reconnect_ack
+        status:
+          type: string
+          const: completed
+          description: Always "completed".
+        messages_replayed:
+          type: integer
+          description: Number of messages replayed from Kafka.
+        message:
+          type: string
+          description: Human-readable summary.
+      examples:
+        - type: reconnect_ack
+          status: completed
+          messages_replayed: 5
+          message: "Replayed 5 missed messages"
+
+    ReconnectError:
+      type: object
+      description: Error response when reconnect/replay fails.
+      required:
+        - type
+        - code
+        - message
+      properties:
+        type:
+          type: string
+          const: reconnect_error
+        code:
+          type: string
+          description: Machine-readable error code.
+          enum:
+            - invalid_request
+            - not_available
+            - replay_failed
+        message:
+          type: string
+          description: Human-readable error description.
+      examples:
+        - type: reconnect_error
+          code: not_available
+          message: "Message replay not available (no Kafka consumer)"
+
+    Pong:
+      type: object
+      description: Response to a heartbeat message.
+      required:
+        - type
+        - ts
+      properties:
+        type:
+          type: string
+          const: pong
+        ts:
+          type: integer
+          format: int64
+          description: Server timestamp in Unix milliseconds.
+      examples:
+        - type: pong
+          ts: 1706000000000
+
+    Error:
+      type: object
+      description: >
+        Generic error response. Sent when a client message cannot be parsed
+        (e.g., invalid JSON), or when a live replay request is rejected.
+        The code field identifies the specific error.
+      required:
+        - type
+        - code
+        - message
+      properties:
+        type:
+          type: string
+          const: error
+        code:
+          type: string
+          description: Machine-readable error code.
+          enum:
+            - invalid_json
+            - invalid_request
+            - not_subscribed
+            - replay_in_progress
+            - replay_rate_limited
+            - offset_out_of_range
+            - replay_failed
+            - not_available
+        channel:
+          type: string
+          description: The channel related to the error (present for replay errors).
+        message:
+          type: string
+          description: Human-readable error description.
+      examples:
+        - type: error
+          code: invalid_json
+          message: "Message is not valid JSON"
+        - type: error
+          code: not_subscribed
+          channel: "sukko.BTC.trade"
+          message: "subscribe before replaying"
+
+    SubscribeError:
+      type: object
+      description: Error response for failed subscribe requests.
+      required:
+        - type
+        - code
+        - message
+      properties:
+        type:
+          type: string
+          const: subscribe_error
+        code:
+          type: string
+          description: Machine-readable error code.
+          enum:
+            - invalid_request
+        message:
+          type: string
+          description: Human-readable error description.
+      examples:
+        - type: subscribe_error
+          code: invalid_request
+          message: "Invalid subscribe request format"
+
+    UnsubscribeError:
+      type: object
+      description: Error response for failed unsubscribe requests.
+      required:
+        - type
+        - code
+        - message
+      properties:
+        type:
+          type: string
+          const: unsubscribe_error
+        code:
+          type: string
+          description: Machine-readable error code.
+          enum:
+            - invalid_request
+        message:
+          type: string
+          description: Human-readable error description.
+      examples:
+        - type: unsubscribe_error
+          code: invalid_request
+          message: "Invalid unsubscribe request format"
+
+    HistoryData:
+      type: object
+      description: Payload for a standalone history request (client→server `history` message type).
+      required:
+        - channel
+        - limit
+      properties:
+        channel:
+          type: string
+          description: "Channel to fetch history for. Must be currently subscribed. Format: {tenant}.{suffix}"
+          examples:
+            - "sukko.BTC.trade"
+        limit:
+          type: integer
+          minimum: 1
+          description: Number of historical messages to retrieve (1 to WS_HISTORY_MAX_LIMIT).
+          examples:
+            - 50
+
+    HistoryComplete:
+      type: object
+      description: >
+        Signals that history delivery is complete for a channel.
+        Sent after all historical messages (tagged `history: true`) have been delivered.
+        All subsequent messages on the channel are live.
+      required:
+        - type
+        - channel
+        - count
+        - source
+      properties:
+        type:
+          type: string
+          const: history_complete
+        channel:
+          type: string
+          description: The channel for which history was delivered.
+        count:
+          type: integer
+          description: Total number of historical messages delivered (may be less than the requested limit).
+        source:
+          type: string
+          description: Source of the delivered history.
+          enum:
+            - cache
+            - kafka
+            - mixed
+        truncated:
+          type: boolean
+          description: Present and true when delivery was cut short by a server-side timeout. Omitted entirely (not present) when false — clients must treat absence as false.
+      examples:
+        - type: history_complete
+          channel: "sukko.BTC.trade"
+          count: 50
+          source: cache
+        - type: history_complete
+          channel: "sukko.BTC.trade"
+          count: 0
+          source: cache
+
+    HistoryError:
+      type: object
+      description: Error response for a failed history or subscribe-with-history request.
+      required:
+        - type
+        - code
+        - channel
+        - message
+      properties:
+        type:
+          type: string
+          const: history_error
+        code:
+          type: string
+          description: Machine-readable error code.
+          enum:
+            - history_disabled
+            - not_available
+            - history_not_subscribed
+            - history_time_range_not_supported
+            - history_invalid_limit
+            - history_in_progress
+            - history_storage_unavailable
+            - history_invalid_channel
+            - history_invalid_request
+        channel:
+          type: string
+          description: The channel that was requested.
+        message:
+          type: string
+          description: Human-readable error description.
+      examples:
+        - type: history_error
+          code: history_disabled
+          channel: "sukko.BTC.trade"
+          message: "message history is not enabled"
+        - type: history_error
+          code: history_storage_unavailable
+          channel: "sukko.BTC.trade"
+          message: "history storage temporarily unavailable"
+
+    GapNotification:
+      type: object
+      description: >
+        Server notifies the client that one or more messages were dropped because
+        the client's send buffer was full. The last_pos field is the Kafka position
+        of the dropped message — clients should use it as from_pos in a replay request
+        to recover all missed messages (conservative anchor; may re-deliver the dropped
+        message itself, but never misses a message).
+      required:
+        - type
+        - channel
+        - from_seq
+        - to_seq
+        - last_pos
+        - ts
+      properties:
+        type:
+          type: string
+          const: gap
+        channel:
+          type: string
+          description: The channel on which message(s) were dropped.
+        from_seq:
+          type: integer
+          format: int64
+          description: Sequence number of the first dropped message.
+        to_seq:
+          type: integer
+          format: int64
+          description: Sequence number of the last dropped message (equal to from_seq for a single drop).
+        last_pos:
+          type: string
+          description: >
+            Kafka position of the dropped message (format: "(partition+1)-offset").
+            Use as from_pos in a replay request to recover missed messages.
+        ts:
+          type: integer
+          format: int64
+          description: Unix timestamp in milliseconds when the gap was detected.
+      examples:
+        - type: gap
+          channel: "sukko.BTC.trade"
+          from_seq: 42
+          to_seq: 44
+          last_pos: "2-12344"
+          ts: 1718041234567
+
+    ReplayRequest:
+      type: object
+      description: >
+        Client requests replay of missed messages on the existing connection
+        without reconnecting. The server responds with zero or more replay_message
+        envelopes followed by a replay_complete message.
+      required:
+        - type
+        - data
+      properties:
+        type:
+          type: string
+          const: replay
+        data:
+          type: object
+          required:
+            - channel
+            - from_pos
+          properties:
+            channel:
+              type: string
+              description: The channel to replay. Client must be subscribed to this channel.
+            from_pos:
+              type: string
+              description: >
+                Kafka position string (format: "(partition+1)-offset") from which to start replay.
+                Typically taken from the last_pos field of a gap notification.
+      examples:
+        - type: replay
+          data:
+            channel: "sukko.BTC.trade"
+            from_pos: "2-12344"
+
+    ReplayMessage:
+      type: object
+      description: A single replayed message delivered during live gap recovery.
+      required:
+        - type
+        - seq
+        - channel
+        - ts
+        - data
+      properties:
+        type:
+          type: string
+          const: replay_message
+        seq:
+          type: integer
+          format: int64
+          description: Client-scoped sequence number for this message.
+        channel:
+          type: string
+          description: The channel this message belongs to.
+        ts:
+          type: integer
+          format: int64
+          description: Unix timestamp in milliseconds of this message.
+        data:
+          type: object
+          description: The message payload.
+        pos:
+          type: string
+          description: Kafka position of this message (optional).
+      examples:
+        - type: replay_message
+          seq: 101
+          channel: "sukko.BTC.trade"
+          ts: 1718041234100
+          data:
+            price: "65432.10"
+            volume: "0.5"
+          pos: "2-12345"
+
+    ReplayComplete:
+      type: object
+      description: >
+        Signals that replay delivery is finished. If truncated is true, delivery was
+        cut short by a timeout or client disconnect — the client may need to request
+        another replay from a newer cursor.
+        The truncated field is omitempty: it is absent entirely when false.
+        Clients MUST treat a missing truncated field as false.
+      required:
+        - type
+        - channel
+        - messages_replayed
+      properties:
+        type:
+          type: string
+          const: replay_complete
+        channel:
+          type: string
+          description: The channel for which replay was performed.
+        messages_replayed:
+          type: integer
+          description: Number of replay_message envelopes delivered (may be 0).
+        truncated:
+          type: boolean
+          description: >
+            Present and true when delivery was cut short by a timeout or client disconnect.
+            Omitted entirely (not present as false) when replay completed normally.
+            Clients must treat absence as false.
+      examples:
+        - type: replay_complete
+          channel: "sukko.BTC.trade"
+          messages_replayed: 3
+        - type: replay_complete
+          channel: "sukko.BTC.trade"
+          messages_replayed: 1
+          truncated: true
+
+  messages:
+    subscribe:
+      name: subscribe
+      title: Subscribe
+      summary: Subscribe to one or more channels.
+      contentType: application/json
+      payload:
+        type: object
+        required:
+          - type
+          - data
+        properties:
+          type:
+            type: string
+            const: subscribe
+          data:
+            $ref: "#/components/schemas/SubscribeData"
+      examples:
+        - name: subscribeMultiChannel
+          payload:
+            type: subscribe
+            data:
+              channels:
+                - "sukko.general.messages"
+                - "sukko.support.typing"
+        - name: subscribeWithHistory
+          payload:
+            type: subscribe
+            data:
+              channel: "sukko.BTC.trade"
+              history:
+                limit: 50
+
+    unsubscribe:
+      name: unsubscribe
+      title: Unsubscribe
+      summary: Unsubscribe from one or more channels.
+      contentType: application/json
+      payload:
+        type: object
+        required:
+          - type
+          - data
+        properties:
+          type:
+            type: string
+            const: unsubscribe
+          data:
+            $ref: "#/components/schemas/UnsubscribeData"
+      examples:
+        - name: unsubscribeExample
+          payload:
+            type: unsubscribe
+            data:
+              channels:
+                - "sukko.general.messages"
+
+    publish:
+      name: publish
+      title: Publish
+      summary: Publish a message to a channel.
+      contentType: application/json
+      payload:
+        type: object
+        required:
+          - type
+          - data
+        properties:
+          type:
+            type: string
+            const: publish
+          data:
+            $ref: "#/components/schemas/PublishData"
+      examples:
+        - name: publishExample
+          payload:
+            type: publish
+            data:
+              channel: "sukko.general.messages"
+              data:
+                text: "Hello everyone!"
+                sender: "user123"
+
+    reconnect:
+      name: reconnect
+      title: Reconnect
+      summary: Reconnect and replay missed messages from Kafka offsets.
+      contentType: application/json
+      payload:
+        type: object
+        required:
+          - type
+          - data
+        properties:
+          type:
+            type: string
+            const: reconnect
+          data:
+            $ref: "#/components/schemas/ReconnectData"
+      examples:
+        - name: reconnectExample
+          payload:
+            type: reconnect
+            data:
+              client_id: "abc123"
+              last_pos:
+                "sukko.BTC.trade": "3-100"
+
+    heartbeat:
+      name: heartbeat
+      title: Heartbeat
+      summary: Send a heartbeat to keep the connection alive.
+      contentType: application/json
+      payload:
+        type: object
+        required:
+          - type
+        properties:
+          type:
+            type: string
+            const: heartbeat
+          data:
+            type: object
+      examples:
+        - name: heartbeatExample
+          payload:
+            type: heartbeat
+            data: {}
+
+    message:
+      name: message
+      title: Broadcast Message
+      summary: A broadcast message on a subscribed channel.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/MessageEnvelope"
+
+    subscriptionAck:
+      name: subscriptionAck
+      title: Subscription Acknowledgment
+      summary: Confirms which channels were subscribed.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/SubscriptionAck"
+
+    unsubscriptionAck:
+      name: unsubscriptionAck
+      title: Unsubscription Acknowledgment
+      summary: Confirms which channels were unsubscribed.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/UnsubscriptionAck"
+
+    publishAck:
+      name: publishAck
+      title: Publish Acknowledgment
+      summary: Confirms a message was accepted for publishing.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/PublishAck"
+
+    publishError:
+      name: publishError
+      title: Publish Error
+      summary: Indicates a publish operation failed.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/PublishError"
+
+    reconnectAck:
+      name: reconnectAck
+      title: Reconnect Acknowledgment
+      summary: Confirms message replay completed.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/ReconnectAck"
+
+    reconnectError:
+      name: reconnectError
+      title: Reconnect Error
+      summary: Indicates reconnect/replay failed.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/ReconnectError"
+
+    pong:
+      name: pong
+      title: Pong
+      summary: Heartbeat response with server timestamp.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/Pong"
+
+    error:
+      name: error
+      title: Error
+      summary: Generic error response.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/Error"
+
+    subscribeError:
+      name: subscribeError
+      title: Subscribe Error
+      summary: Error for failed subscribe requests.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/SubscribeError"
+
+    unsubscribeError:
+      name: unsubscribeError
+      title: Unsubscribe Error
+      summary: Error for failed unsubscribe requests.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/UnsubscribeError"
+
+    auth:
+      name: auth
+      title: Auth Refresh / Escalation
+      summary: Refresh JWT token or escalate from API-key-only to full JWT access.
+      description: >
+        Send a new JWT token to refresh credentials mid-connection without disconnecting.
+        API-key-only connections can send this to escalate to full JWT access (user-scoped channels, publish).
+        The JWT tenant must match the connection's tenant. Rate limited to 1 per 30 seconds.
+      contentType: application/json
+      payload:
+        type: object
+        required:
+          - type
+          - data
+        properties:
+          type:
+            type: string
+            const: auth
+          data:
+            $ref: "#/components/schemas/AuthData"
+      examples:
+        - name: authRefreshExample
+          payload:
+            type: auth
+            data:
+              token: "eyJhbGciOiJFZDI1NTE5IiwidHlwIjoiSldUIn0..."
+
+    authAck:
+      name: authAck
+      title: Auth Acknowledgment
+      summary: Confirms auth refresh/escalation succeeded.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/AuthAck"
+
+    authError:
+      name: authError
+      title: Auth Error
+      summary: Indicates auth refresh/escalation failed.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/AuthError"
+
+    history:
+      name: history
+      title: History Request
+      summary: Request historical messages for a subscribed channel.
+      contentType: application/json
+      payload:
+        type: object
+        required:
+          - type
+          - data
+        properties:
+          type:
+            type: string
+            const: history
+          data:
+            $ref: "#/components/schemas/HistoryData"
+      examples:
+        - name: historyExample
+          payload:
+            type: history
+            data:
+              channel: "sukko.BTC.trade"
+              limit: 50
+
+    historyComplete:
+      name: historyComplete
+      title: History Complete
+      summary: Signals that all historical messages for a channel have been delivered.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/HistoryComplete"
+
+    historyError:
+      name: historyError
+      title: History Error
+      summary: Indicates a history request failed.
+      description: |
+        Error code retriability:
+        - `history_disabled`: not retriable — the feature is off at the server level
+        - `history_storage_unavailable`: retriable — Valkey is temporarily unreachable; retry with exponential backoff
+        - All other codes: not retriable without fixing the root cause (subscribe first, adjust limit, upgrade edition, etc.)
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/HistoryError"
+
+    gap:
+      name: gap
+      title: Gap Notification
+      summary: >
+        Server notifies the client that one or more messages were dropped
+        because the client's send buffer was full. The client should send
+        a replay request using last_pos as from_pos to recover missed messages.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/GapNotification"
+
+    replay:
+      name: replay
+      title: Live Replay Request
+      summary: >
+        Client requests replay of missed messages on the existing connection
+        without reconnecting. The from_pos cursor identifies where to start.
+        The server must respond with zero or more replay_message envelopes
+        followed by a replay_complete message.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/ReplayRequest"
+
+    replayMessage:
+      name: replayMessage
+      title: Replay Message
+      summary: A single replayed message delivered during live gap recovery.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/ReplayMessage"
+
+    replayComplete:
+      name: replayComplete
+      title: Replay Complete
+      summary: >
+        Signals that replay delivery is finished. If truncated is true,
+        delivery was cut short by a timeout or client disconnect.
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/ReplayComplete"

@@ -35,6 +35,21 @@ linters:
     - unconvert
     - unparam
 
+  exclusions:
+    rules:
+      # G304 flags opening a file through a variable path, on the assumption the
+      # path could be attacker-controlled. In tests it never is: the conformance
+      # and fixture helpers walk this module's own testdata directory, and the
+      # only way to influence those paths is to already have commit access.
+      #
+      # Scoped to G304 in tests specifically. gosec stays active on runtime code,
+      # where paths do come from callers — loading a custom CA bundle is exactly
+      # the case this rule exists to catch.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G304"
+
 formatters:
   enable:
     - gofmt

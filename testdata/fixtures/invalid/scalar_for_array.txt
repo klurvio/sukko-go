@@ -1,0 +1,1 @@
+{"type":"subscription_ack","subscribed":"acme.orders.eu"}

@@ -1,0 +1,1 @@
+{"type":"message","channel":"acme.orders.eu","seq":1,"ts":1,"data":

@@ -1,0 +1,707 @@
+openapi: 3.1.0
+
+info:
+  title: Sukko Gateway API
+  version: 1.0.0
+  description: |
+    REST API for the Sukko WebSocket Gateway. Provides SSE streaming, REST publish,
+    push notification management, and operational endpoints.
+
+    ## Authentication
+
+    All client-facing endpoints require authentication via one of:
+    - **JWT**: `Authorization: Bearer {jwt}` header or `?token={jwt}` query parameter
+    - **API key**: `X-API-Key: {key}` header or `?api_key={key}` query parameter
+    - **Both**: JWT + API key (tenant IDs must match)
+
+    Query parameters take precedence over headers when both are provided.
+
+    Health, readiness, version, edition, config, and metrics endpoints require no authentication.
+
+    ## Edition Gates
+
+    Some endpoints require a specific license edition:
+    - **Pro**: SSE streaming (`GET /sse`), REST publish (`POST /api/v1/publish`)
+    - **Enterprise**: Push notification endpoints (`/api/v1/push/*`)
+
+    Community edition users receive 403 with `EDITION_LIMIT` when accessing gated endpoints.
+
+    ## Error Format
+
+    All errors return: `{"code": "UPPER_SNAKE_CASE", "message": "human-readable"}`.
+  contact:
+    name: Sukko Platform Team
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: http://{host}:{port}
+    description: Gateway service
+    variables:
+      host:
+        default: localhost
+      port:
+        default: "3000"
+
+paths:
+  # ── Operational Endpoints ──────────────────────────────────────────
+  /health:
+    get:
+      operationId: health
+      summary: Liveness check
+      description: Always returns 200 — the process is alive. Reports stream connectivity status.
+      tags: [Operational]
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                service: ws-gateway
+                provisioning_keys_stream: connected
+                provisioning_config_stream: connected
+                provisioning_api_keys_stream: connected
+                provisioning_license_stream: connected
+
+  /ready:
+    get:
+      operationId: ready
+      summary: Readiness check
+      description: Returns 200 when all streams are connected, 503 when degraded. Used by Kubernetes readiness probe.
+      tags: [Operational]
+      responses:
+        "200":
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Service is degraded (stream connectivity issue)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: degraded
+                service: ws-gateway
+                provisioning_keys_stream: disconnected
+                provisioning_config_stream: connected
+                provisioning_api_keys_stream: connected
+                provisioning_license_stream: connected
+
+  /version:
+    get:
+      operationId: version
+      summary: Build version info
+      tags: [Operational]
+      responses:
+        "200":
+          description: Version information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                  commit:
+                    type: string
+                  timestamp:
+                    type: string
+
+  /edition:
+    get:
+      operationId: edition
+      summary: Current edition and usage
+      tags: [Operational]
+      responses:
+        "200":
+          description: Edition information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  edition:
+                    type: string
+                    enum: [community, pro, enterprise]
+                  org:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+                  usage:
+                    type: object
+                    properties:
+                      connections:
+                        type: integer
+                      shards:
+                        type: integer
+
+  /config:
+    get:
+      operationId: config
+      summary: Runtime configuration (redacted)
+      description: Returns current configuration with sensitive fields redacted.
+      tags: [Operational]
+      responses:
+        "200":
+          description: Configuration (sensitive fields redacted)
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics
+      tags: [Operational]
+      responses:
+        "200":
+          description: Prometheus text format metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  # ── WebSocket ──────────────────────────────────────────────────────
+  /ws:
+    get:
+      operationId: websocketUpgrade
+      summary: WebSocket connection upgrade
+      description: |
+        Upgrades the HTTP connection to a WebSocket. Requires authentication via JWT, API key, or both.
+
+        See the [AsyncAPI spec](../asyncapi/client-ws.asyncapi.yaml) for the full WebSocket message protocol.
+      tags: [WebSocket]
+      security:
+        - bearerToken: []
+        - queryToken: []
+        - apiKey: []
+        - apiKeyQuery: []
+      parameters:
+        - name: token
+          in: query
+          schema:
+            type: string
+          description: JWT token (takes precedence over Authorization header)
+        - name: api_key
+          in: query
+          schema:
+            type: string
+          description: API key (takes precedence over X-API-Key header)
+      responses:
+        "101":
+          description: WebSocket upgrade successful
+        "401":
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Tenant connection limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: TENANT_LIMIT_EXCEEDED
+                message: "tenant connection limit exceeded"
+
+  # ── SSE (Pro) ──────────────────────────────────────────────────────
+  /sse:
+    get:
+      operationId: sseStream
+      summary: Server-Sent Events stream
+      description: |
+        Subscribe to real-time events via SSE. Channels are specified as a comma-separated query parameter.
+
+        **Edition**: Pro (SSE Transport feature gate)
+
+        **Event format**:
+        ```
+        id: {sequence}
+        event: message
+        data: {"type":"message","seq":1,"ts":1706000000000,"channel":"sukko.BTC.trade","data":{...}}
+        ```
+
+        Keepalive comments (`: keepalive`) are sent periodically to keep the connection alive.
+        Supports `Last-Event-ID` header for reconnection.
+      tags: [SSE]
+      security:
+        - bearerToken: []
+        - queryToken: []
+        - apiKey: []
+        - apiKeyQuery: []
+      x-edition: pro
+      parameters:
+        - name: channels
+          in: query
+          required: true
+          schema:
+            type: string
+          description: "Comma-separated list of channels. All channels must be tenant-prefixed: {tenant}.{suffix}"
+          example: "sukko.BTC.trade,sukko.ETH.trade"
+        - name: token
+          in: query
+          schema:
+            type: string
+          description: JWT token
+        - name: api_key
+          in: query
+          schema:
+            type: string
+          description: API key
+      responses:
+        "200":
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          description: Missing or empty channels parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: INVALID_REQUEST
+                message: "channels query parameter is required"
+        "401":
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Edition gate — requires Pro
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Tenant connection limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: TENANT_LIMIT_EXCEEDED
+                message: "tenant connection limit reached"
+        "503":
+          description: ws-server not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── REST Publish (Pro) ─────────────────────────────────────────────
+  /api/v1/publish:
+    post:
+      operationId: publish
+      summary: Publish a message to a channel
+      description: |
+        Publish a JSON message to a channel via REST. The message is forwarded to ws-server
+        via gRPC and broadcast to all subscribed WebSocket/SSE clients.
+
+        **Edition**: Pro (SSE Transport feature gate)
+
+        **Rate limiting**: Per-tenant + per-IP. Returns 429 when exceeded.
+
+        **Size limit**: Request body capped at `GATEWAY_MAX_PUBLISH_SIZE` (default 64KB).
+      tags: [Publish]
+      security:
+        - bearerToken: []
+        - queryToken: []
+        - apiKey: []
+        - apiKeyQuery: []
+      x-edition: pro
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, data]
+              properties:
+                channel:
+                  type: string
+                  description: "Target channel. Format: {tenant}.{suffix}"
+                  example: "sukko.general.messages"
+                data:
+                  type: object
+                  description: Arbitrary JSON payload
+                  example: { "text": "Hello everyone!", "sender": "user123" }
+      responses:
+        "200":
+          description: Message published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  channel:
+                    type: string
+              example:
+                status: "accepted"
+                channel: "sukko.general.messages"
+        "400":
+          description: |
+            Invalid request. Codes: `INVALID_REQUEST` — malformed body, wrong
+            Content-Type, invalid JSON, missing `channel`/`data`, or a channel with
+            too few dot-separated parts; `INVALID_CHANNEL` — the channel fails
+            server-side format validation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: INVALID_REQUEST
+                message: "channel is required"
+        "401":
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: |
+            Forbidden — one of: edition gate (requires Pro), API-key-only
+            authentication (publish requires JWT), channel tenant prefix
+            mismatch, or the tenant's channel rules deny publish to this
+            channel (per-tenant publish rules are the sole publish
+            authorization source; a tenant with no publish rules is denied).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: FORBIDDEN
+                message: "channel rules deny publish to this channel"
+        "409":
+          description: |
+            Publish not routable (Kafka backend only) — either the tenant has no routing
+            rules provisioned at all, or it has rules but none match this channel. In both
+            cases the message cannot be produced to a topic and is rejected (never silently
+            dead-lettered). Resolve by provisioning a routing rule whose pattern matches the
+            channel. The direct (Community) backend has no routing rules and never returns this.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: PUBLISH_NOT_ROUTABLE
+                message: "no routing rule applies to this channel for the tenant"
+        "413":
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: BODY_TOO_LARGE
+                message: "request body exceeds maximum publish size"
+        "429":
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: RATE_LIMITED
+                message: "publish rate limit exceeded"
+        "503":
+          description: |
+            Service unavailable (retryable) — either the ws-server connection is down, or
+            (Kafka backend) the tenant routing snapshot has not yet synced / the producer
+            circuit breaker is open. Retry with backoff.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: SERVICE_UNAVAILABLE
+                message: "publish temporarily unavailable, retry"
+
+  # ── Push Subscribe (Enterprise) ────────────────────────────────────
+  /api/v1/push/subscribe:
+    post:
+      operationId: pushSubscribe
+      summary: Register a push notification subscription
+      description: |
+        Register a device for push notifications on specified channels.
+        Platform-specific fields are required depending on the platform.
+
+        **Edition**: Enterprise (Push Notifications feature gate)
+      tags: [Push]
+      security:
+        - bearerToken: []
+        - queryToken: []
+        - apiKey: []
+        - apiKeyQuery: []
+      x-edition: enterprise
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform, channels]
+              properties:
+                platform:
+                  type: string
+                  enum: [web, android, ios]
+                token:
+                  type: string
+                  description: Device token (required for android/ios)
+                endpoint:
+                  type: string
+                  description: Push endpoint URL (required for web)
+                p256dh_key:
+                  type: string
+                  description: P-256 DH key (required for web)
+                auth_secret:
+                  type: string
+                  description: Auth secret (required for web)
+                channels:
+                  type: array
+                  items:
+                    type: string
+                  description: "Channels to receive push notifications for. Must be tenant-prefixed: {tenant}.{suffix}"
+            examples:
+              web:
+                value:
+                  platform: web
+                  endpoint: "https://fcm.googleapis.com/fcm/send/..."
+                  p256dh_key: "BNcR..."
+                  auth_secret: "tBH..."
+                  channels: ["acme.general.messages"]
+              android:
+                value:
+                  platform: android
+                  token: "fcm-device-token-123"
+                  channels: ["acme.general.messages"]
+      responses:
+        "201":
+          description: Subscription registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device_id:
+                    type: integer
+                    format: int64
+              example:
+                device_id: 12345
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Edition gate — requires Enterprise
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Push service not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    delete:
+      operationId: pushUnsubscribe
+      summary: Unregister a push notification subscription
+      description: |
+        Remove a device's push notification registration.
+
+        **Edition**: Enterprise (Push Notifications feature gate)
+      tags: [Push]
+      security:
+        - bearerToken: []
+        - queryToken: []
+        - apiKey: []
+        - apiKeyQuery: []
+      x-edition: enterprise
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id]
+              properties:
+                device_id:
+                  type: integer
+                  format: int64
+            example:
+              device_id: 12345
+      responses:
+        "200":
+          description: Subscription removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+              example:
+                success: true
+        "400":
+          description: Missing device_id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Edition gate — requires Enterprise
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Push service not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── VAPID Key (Enterprise) ─────────────────────────────────────────
+  /api/v1/push/vapid-key:
+    get:
+      operationId: getVapidKey
+      summary: Get tenant's VAPID public key
+      description: |
+        Retrieve the VAPID public key for the authenticated tenant.
+        Used by web clients to create Web Push subscriptions.
+
+        **Edition**: Enterprise (Push Notifications feature gate)
+      tags: [Push]
+      security:
+        - bearerToken: []
+        - queryToken: []
+        - apiKey: []
+        - apiKeyQuery: []
+      x-edition: enterprise
+      responses:
+        "200":
+          description: VAPID public key
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  public_key:
+                    type: string
+                    description: VAPID public key (base64url-encoded)
+              example:
+                public_key: "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7k8a2T4P4YRQT..."
+        "401":
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Edition gate — requires Enterprise
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Failed to retrieve VAPID key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Push service not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "Authorization: Bearer {jwt}"
+    queryToken:
+      type: apiKey
+      in: query
+      name: token
+      description: "?token={jwt} — takes precedence over Authorization header"
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: "X-API-Key header for API key auth (public channels only, no publish via WebSocket)"
+    apiKeyQuery:
+      type: apiKey
+      in: query
+      name: api_key
+      description: "?api_key={key} — takes precedence over X-API-Key header"
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code (UPPER_SNAKE_CASE)
+        message:
+          type: string
+          description: Human-readable error description
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        service:
+          type: string
+          const: ws-gateway
+        provisioning_keys_stream:
+          type: string
+          enum: [connected, disconnected, disabled]
+        provisioning_config_stream:
+          type: string
+          enum: [connected, disconnected, disabled]
+        provisioning_api_keys_stream:
+          type: string
+          enum: [connected, disconnected, disabled]
+        provisioning_license_stream:
+          type: string
+          enum: [connected, disconnected, disabled]

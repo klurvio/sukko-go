@@ -1,0 +1,1 @@
+{"type":"auth_error","data":{"code":"tenant_mismatch","message":"Token tenant does not match connection tenant"}}

@@ -1,0 +1,1 @@
+{"channel":"acme.orders.eu","seq":1}
