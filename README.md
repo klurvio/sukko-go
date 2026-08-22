@@ -11,8 +11,11 @@ market-data / event subscription for backend services, data pipelines, and edge 
 - **`context.Context`-driven** lifecycle, typed errors (`errors.Is`/`errors.As`), pull-based `Stats()`.
 - Built to the AsyncAPI v1.4.0 + gateway OpenAPI contracts.
 
-> 🚧 **Pre-release.** The API shown below is the target design (see [`specs/`](specs/backlog/feat/go-sdk/spec.md));
-> the implementation is in progress. `go get` claims the module path; symbols land as the SDK is built.
+> 🚧 **Pre-release.** The API shown below is the target design; the implementation is in progress.
+> `go get` claims the module path, and symbols land as the SDK is built — so expect the surface to be
+> incomplete until `v0.1.0` is tagged. Design rationale lives in the package documentation and in the
+> commit history; the behavioural contract is the [AsyncAPI](https://github.com/klurvio/sukko) client
+> protocol, which this SDK follows rather than any sibling SDK's current behaviour.
 
 ```bash
 go get github.com/klurvio/sukko-go
