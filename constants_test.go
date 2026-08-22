@@ -1,184 +1,207 @@
 package sukko
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
-// TestEnumStringForms pins the wire/string form of every exported enum.
+// TestEnumWireValues pins each enum constant to its exact underlying string.
 //
-// These strings are public API frozen from v0.1.0 and several are contract
-// values (PushPlatform mirrors the gateway's closed `enum: [web, android, ios]`;
-// HistorySource mirrors `history_complete.source`). ConnectionState's six values
-// are asserted verbatim per NFR-005(oo) — including StateClosed == "closed",
-// the resting state a clean stop terminates in.
-func TestEnumStringForms(t *testing.T) {
+// These are string-backed types, and for several the underlying value IS the
+// wire value: PushPlatform mirrors the gateway's closed push-subscribe enum and
+// HistorySource mirrors `history_complete.source`. Pinning the underlying string
+// (not just String()) is what keeps encoding correct — see TestEnumJSONRoundTrip.
+// ConnectionState's six values are asserted verbatim per NFR-005(oo), including
+// StateClosed == "closed".
+func TestEnumWireValues(t *testing.T) {
 	t.Parallel()
 
 	t.Run("ConnectionState", func(t *testing.T) {
 		t.Parallel()
-		for _, tc := range []struct {
-			state ConnectionState
-			want  string
-		}{
-			{StateDisconnected, "disconnected"},
-			{StateConnecting, "connecting"},
-			{StateConnected, "connected"},
-			{StateReconnecting, "reconnecting"},
-			{StateError, "error"},
-			{StateClosed, "closed"},
+		for want, got := range map[string]ConnectionState{
+			"disconnected": StateDisconnected,
+			"connecting":   StateConnecting,
+			"connected":    StateConnected,
+			"reconnecting": StateReconnecting,
+			"error":        StateError,
+			"closed":       StateClosed,
 		} {
-			if got := tc.state.String(); got != tc.want {
-				t.Errorf("ConnectionState.String() = %q, want %q", got, tc.want)
+			if string(got) != want {
+				t.Errorf("ConnectionState = %q, want %q", string(got), want)
+			}
+			if got.String() != want {
+				t.Errorf("ConnectionState.String() = %q, want %q", got.String(), want)
 			}
 		}
 	})
 
 	t.Run("MessageSource", func(t *testing.T) {
 		t.Parallel()
-		for _, tc := range []struct {
-			source MessageSource
-			want   string
-		}{
-			{SourceLive, "live"},
-			{SourceHistory, "history"},
-			{SourceReplay, "replay"},
+		for want, got := range map[string]MessageSource{
+			"live":    SourceLive,
+			"history": SourceHistory,
+			"replay":  SourceReplay,
 		} {
-			if got := tc.source.String(); got != tc.want {
-				t.Errorf("MessageSource.String() = %q, want %q", got, tc.want)
+			if string(got) != want || got.String() != want {
+				t.Errorf("MessageSource = %q/%q, want %q", string(got), got.String(), want)
 			}
 		}
 	})
 
 	t.Run("HistorySource", func(t *testing.T) {
 		t.Parallel()
-		for _, tc := range []struct {
-			source HistorySource
-			want   string
-		}{
-			{HistorySourceCache, "cache"},
-			{HistorySourceKafka, "kafka"},
-			{HistorySourceMixed, "mixed"},
+		for want, got := range map[string]HistorySource{
+			"cache": HistorySourceCache,
+			"kafka": HistorySourceKafka,
+			"mixed": HistorySourceMixed,
 		} {
-			if got := tc.source.String(); got != tc.want {
-				t.Errorf("HistorySource.String() = %q, want %q", got, tc.want)
+			if string(got) != want || got.String() != want {
+				t.Errorf("HistorySource = %q/%q, want %q", string(got), got.String(), want)
 			}
 		}
 	})
 
 	t.Run("Edition", func(t *testing.T) {
 		t.Parallel()
-		for _, tc := range []struct {
-			edition Edition
-			want    string
-		}{
-			{EditionPro, "pro"},
-			{EditionEnterprise, "enterprise"},
+		for want, got := range map[string]Edition{
+			"pro":        EditionPro,
+			"enterprise": EditionEnterprise,
 		} {
-			if got := tc.edition.String(); got != tc.want {
-				t.Errorf("Edition.String() = %q, want %q", got, tc.want)
+			if string(got) != want || got.String() != want {
+				t.Errorf("Edition = %q/%q, want %q", string(got), got.String(), want)
 			}
 		}
 	})
 
 	t.Run("AuthMode", func(t *testing.T) {
 		t.Parallel()
-		for _, tc := range []struct {
-			mode AuthMode
-			want string
-		}{
-			{AuthRefresh, "refresh"},
-			{AuthEscalation, "escalation"},
+		for want, got := range map[string]AuthMode{
+			"refresh":    AuthRefresh,
+			"escalation": AuthEscalation,
 		} {
-			if got := tc.mode.String(); got != tc.want {
-				t.Errorf("AuthMode.String() = %q, want %q", got, tc.want)
+			if string(got) != want || got.String() != want {
+				t.Errorf("AuthMode = %q/%q, want %q", string(got), got.String(), want)
 			}
 		}
 	})
 
-	// PushPlatform values are contract values — the gateway's push subscribe
-	// endpoint declares a closed enum, so these strings must match it exactly.
 	t.Run("PushPlatform", func(t *testing.T) {
 		t.Parallel()
-		for _, tc := range []struct {
-			platform PushPlatform
-			want     string
-		}{
-			{PlatformWeb, "web"},
-			{PlatformAndroid, "android"},
-			{PlatformIOS, "ios"},
+		for want, got := range map[string]PushPlatform{
+			"web":     PlatformWeb,
+			"android": PlatformAndroid,
+			"ios":     PlatformIOS,
 		} {
-			if got := tc.platform.String(); got != tc.want {
-				t.Errorf("PushPlatform.String() = %q, want %q", got, tc.want)
+			if string(got) != want || got.String() != want {
+				t.Errorf("PushPlatform = %q/%q, want %q", string(got), got.String(), want)
 			}
 		}
 	})
 
 	t.Run("TransportKind", func(t *testing.T) {
 		t.Parallel()
-		for _, tc := range []struct {
-			kind TransportKind
-			want string
-		}{
-			{TransportWebSocket, "websocket"},
-			{TransportSSE, "sse"},
+		for want, got := range map[string]TransportKind{
+			"websocket": TransportWebSocket,
+			"sse":       TransportSSE,
 		} {
-			if got := tc.kind.String(); got != tc.want {
-				t.Errorf("TransportKind.String() = %q, want %q", got, tc.want)
+			if string(got) != want || got.String() != want {
+				t.Errorf("TransportKind = %q/%q, want %q", string(got), got.String(), want)
 			}
 		}
 	})
 }
 
-// TestEnumZeroValues pins each enum's zero value.
-//
-// A Go zero value is what a caller gets from `var s ConnectionState` or an
-// unset struct field, so it is API whether or not it is chosen deliberately.
-// StateDisconnected is the zero ConnectionState because it is the state a
-// client legitimately occupies before Connect. The remaining enums have no
-// meaningful zero, so theirs is an explicit invalid sentinel that stringifies
-// recognisably rather than masquerading as a valid value.
-func TestEnumZeroValues(t *testing.T) {
+// TestEnumJSONRoundTrip is the reason these types are string-backed rather than
+// int-backed: the contract-valued enums must encode as their wire strings with
+// no conversion step. An int-backed PushPlatform would marshal as a number and
+// the gateway would reject the push-subscribe request.
+func TestEnumJSONRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	if got := ConnectionState(0); got != StateDisconnected {
-		t.Errorf("zero ConnectionState = %v, want StateDisconnected", got)
+	t.Run("marshals to the wire string", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name string
+			give any
+			want string
+		}{
+			{"PushPlatform", PlatformAndroid, `"android"`},
+			{"HistorySource", HistorySourceMixed, `"mixed"`},
+			{"MessageSource", SourceReplay, `"replay"`},
+			{"ConnectionState", StateClosed, `"closed"`},
+		} {
+			got, err := json.Marshal(tc.give)
+			if err != nil {
+				t.Fatalf("%s: marshal: %v", tc.name, err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("%s marshalled to %s, want %s", tc.name, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("unmarshals from the wire string", func(t *testing.T) {
+		t.Parallel()
+		var platform PushPlatform
+		if err := json.Unmarshal([]byte(`"ios"`), &platform); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if platform != PlatformIOS {
+			t.Errorf("unmarshalled to %q, want %q", platform, PlatformIOS)
+		}
+
+		var source HistorySource
+		if err := json.Unmarshal([]byte(`"kafka"`), &source); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if source != HistorySourceKafka {
+			t.Errorf("unmarshalled to %q, want %q", source, HistorySourceKafka)
+		}
+	})
+}
+
+// TestEnumZeroValue pins the zero value of each enum.
+//
+// A Go zero value is what a caller gets from `var s ConnectionState` or an unset
+// struct field, so it is API whether or not it was chosen deliberately. For a
+// string-backed type the zero is "", which is not a valid value for any of these
+// enums — deliberately, so an unset field cannot masquerade as a valid one.
+// ConnectionState is the one enum whose zero is meaningful.
+func TestEnumZeroValue(t *testing.T) {
+	t.Parallel()
+
+	if StateDisconnected != "disconnected" {
+		t.Errorf("StateDisconnected = %q, want %q", StateDisconnected, "disconnected")
+	}
+	if got := ConnectionState(""); got == StateDisconnected {
+		t.Error("the empty ConnectionState must not equal StateDisconnected")
 	}
 
-	for _, tc := range []struct {
-		name string
-		got  string
-	}{
-		{"MessageSource", MessageSource(0).String()},
-		{"HistorySource", HistorySource(0).String()},
-		{"Edition", Edition(0).String()},
-		{"AuthMode", AuthMode(0).String()},
-		{"PushPlatform", PushPlatform(0).String()},
-		{"TransportKind", TransportKind(0).String()},
+	for name, got := range map[string]string{
+		"MessageSource":   string(MessageSource("")),
+		"HistorySource":   string(HistorySource("")),
+		"Edition":         string(Edition("")),
+		"AuthMode":        string(AuthMode("")),
+		"PushPlatform":    string(PushPlatform("")),
+		"TransportKind":   string(TransportKind("")),
+		"ConnectionState": string(ConnectionState("")),
 	} {
-		if tc.got != "unknown" {
-			t.Errorf("zero %s.String() = %q, want %q", tc.name, tc.got, "unknown")
+		if got != "" {
+			t.Errorf("zero %s = %q, want the empty string", name, got)
 		}
 	}
 }
 
-// TestEnumStringOutOfRange ensures an out-of-range value degrades to a
-// recognisable form instead of panicking or indexing past a lookup table —
-// String() is reached from log lines and error messages on failure paths.
-func TestEnumStringOutOfRange(t *testing.T) {
+// TestEnumStringIsTotal ensures String() never panics and never invents a value
+// for an out-of-set string — it is reached from log lines and error messages on
+// failure paths, including when a server sends something the SDK does not know.
+func TestEnumStringIsTotal(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name string
-		got  string
-	}{
-		{"ConnectionState", ConnectionState(99).String()},
-		{"MessageSource", MessageSource(99).String()},
-		{"HistorySource", HistorySource(99).String()},
-		{"Edition", Edition(99).String()},
-		{"AuthMode", AuthMode(99).String()},
-		{"PushPlatform", PushPlatform(99).String()},
-		{"TransportKind", TransportKind(99).String()},
-	} {
-		if tc.got != "unknown" {
-			t.Errorf("out-of-range %s.String() = %q, want %q", tc.name, tc.got, "unknown")
-		}
+	if got := PushPlatform("wearos").String(); got != "wearos" {
+		t.Errorf("unknown PushPlatform.String() = %q, want the value verbatim", got)
+	}
+	if got := ConnectionState("").String(); got != "" {
+		t.Errorf("empty ConnectionState.String() = %q, want the empty string", got)
 	}
 }
