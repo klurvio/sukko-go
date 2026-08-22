@@ -135,9 +135,15 @@ func TestSentinelsAreDistinct(t *testing.T) {
 		"ErrTokenSourceFailed":      ErrTokenSourceFailed,
 		"ErrInsecureTransport":      ErrInsecureTransport,
 		"ErrPublishRequiresJWT":     ErrPublishRequiresJWT,
+		// ErrInvalidChannel is an addition beyond the 14 the error surface
+		// originally enumerated. Channel validation is caller-facing — a caller
+		// checking user input needs errors.Is rather than matching on message
+		// text — so it is a sentinel like the rest, and is counted here so this
+		// enumeration stays the complete set it claims to be.
+		"ErrInvalidChannel": ErrInvalidChannel,
 	}
-	if len(all) != 14 {
-		t.Fatalf("expected 14 sentinels, listed %d", len(all))
+	if len(all) != 15 {
+		t.Fatalf("expected 15 sentinels, listed %d", len(all))
 	}
 	for nameA, a := range all {
 		for nameB, b := range all {
