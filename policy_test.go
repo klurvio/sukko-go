@@ -289,3 +289,189 @@ func TestEveryLiveStateCanTerminate(t *testing.T) {
 		}
 	}
 }
+
+// ─── structural checks ───
+//
+// The four tables claim to be exhaustive enumerations, and two test matrices are
+// generated from them. That only holds if every lookup is total: a key that
+// resolves to nothing would silently drop out of the generated matrix, and the
+// case would go untested while the suite still reported green.
+
+// Every close row must classify, and the reconnect flag must never change a
+// row's existence — only its class. A key that resolved with reconnect enabled
+// and vanished without it would drop half the matrix.
+func TestClosePolicyIsTotalUnderBothReconnectSettings(t *testing.T) {
+	t.Parallel()
+
+	for key := range closeBaseRows {
+		for _, reconnect := range []bool{true, false} {
+			out, ok := lookupClosePolicy(closeKey{key.code, key.direction, reconnect})
+			if !ok {
+				t.Errorf("closePolicy has no row for %+v with reconnect=%v", key, reconnect)
+				continue
+			}
+			if !isKnownClass(out.class) {
+				t.Errorf("%+v resolved to an unknown class %v", key, out.class)
+			}
+		}
+	}
+}
+
+// Disabling reconnect may only ever remove a retry. If it changed a terminal
+// row into a clean stop, a client would report Err() nil for a failure — or
+// worse, turn a clean stop into a terminal error and report a failure that did
+// not happen.
+func TestReconnectFlagOnlyDowngradesReconnectRows(t *testing.T) {
+	t.Parallel()
+
+	for key := range closeBaseRows {
+		enabled, _ := lookupClosePolicy(closeKey{key.code, key.direction, true})
+		disabled, _ := lookupClosePolicy(closeKey{key.code, key.direction, false})
+
+		switch enabled.class {
+		case classReconnect:
+			if disabled.class != classCleanStop {
+				t.Errorf("%+v: reconnect-class became %v with reconnect disabled, want clean-stop",
+					key, disabled.class)
+			}
+		default:
+			if disabled.class != enabled.class {
+				t.Errorf("%+v: %v changed to %v with reconnect disabled; the flag must only remove retries",
+					key, enabled.class, disabled.class)
+			}
+		}
+	}
+}
+
+// The handshake table is total by construction — unlisted statuses fall back by
+// class — so no HTTP status may leave an outcome unclassified.
+func TestHandshakePolicyIsTotal(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{
+		100, 200, 301, 400, 401, 402, 403, 404, 418, 429, 451,
+		500, 502, 503, 504, 599,
+	} {
+		for _, reconnect := range []bool{true, false} {
+			out := lookupHandshakePolicy(status, "", reconnect)
+			if !isKnownClass(out.class) {
+				t.Errorf("status %d (reconnect=%v) resolved to an unknown class %v",
+					status, reconnect, out.class)
+			}
+		}
+	}
+}
+
+// Every internal cause must classify under both settings, for the same reason
+// the close table must.
+func TestInternalCausePolicyIsTotal(t *testing.T) {
+	t.Parallel()
+
+	for cause := range internalCauseRows {
+		for _, reconnect := range []bool{true, false} {
+			out, ok := lookupInternalCausePolicy(cause, reconnect)
+			if !ok {
+				t.Errorf("internalCausePolicy has no row for %v (reconnect=%v)", cause, reconnect)
+				continue
+			}
+			if !isKnownClass(out.class) {
+				t.Errorf("%v resolved to an unknown class %v", cause, out.class)
+			}
+		}
+	}
+}
+
+// Every transition must land on one of the six states. A transition to a value
+// outside the enum would leave State() reporting something no caller can match,
+// which is the defect the six-value closed set exists to prevent.
+func TestStateTransitionsLandInsideTheEnum(t *testing.T) {
+	t.Parallel()
+
+	valid := map[ConnectionState]bool{
+		StateDisconnected: true, StateConnecting: true, StateConnected: true,
+		StateReconnecting: true, StateError: true, StateClosed: true,
+	}
+
+	for key, to := range stateTransitions {
+		if !valid[key.from] {
+			t.Errorf("transition from %q, which is not one of the six states", key.from)
+		}
+		if !valid[to] {
+			t.Errorf("%v on %v lands on %q, which is not one of the six states", key.from, key.on, to)
+		}
+	}
+}
+
+// Every state must be reachable. An unreachable state is dead API: it appears
+// in the enum, a caller writes a branch for it, and the branch never runs.
+func TestEveryStateIsReachable(t *testing.T) {
+	t.Parallel()
+
+	reached := map[ConnectionState]bool{
+		// The initial state needs no transition to reach it.
+		StateDisconnected: true,
+	}
+	for _, to := range stateTransitions {
+		reached[to] = true
+	}
+
+	for _, state := range []ConnectionState{
+		StateDisconnected, StateConnecting, StateConnected,
+		StateReconnecting, StateError, StateClosed,
+	} {
+		if !reached[state] {
+			t.Errorf("state %q is unreachable; no transition lands on it", state)
+		}
+	}
+}
+
+// Every non-resting state must reach a resting one under some trigger, or a
+// client could stall somewhere with no way to terminate.
+func TestEveryLiveStateHasAPathToRest(t *testing.T) {
+	t.Parallel()
+
+	for _, from := range []ConnectionState{
+		StateDisconnected, StateConnecting, StateConnected, StateReconnecting,
+	} {
+		var canRest bool
+		for _, on := range allTriggers() {
+			if to, ok := lookupStateTransition(from, on); ok && (to == StateClosed || to == StateError) {
+				canRest = true
+				break
+			}
+		}
+		if !canRest {
+			t.Errorf("state %q has no transition to a resting state", from)
+		}
+	}
+}
+
+// The class vocabulary is closed: three values, each with a distinct name. A
+// duplicate name would make a test failure ambiguous about which class was meant.
+func TestTerminationClassVocabularyIsClosed(t *testing.T) {
+	t.Parallel()
+
+	names := map[string]bool{}
+	for _, class := range []terminationClass{classReconnect, classCleanStop, classTerminal} {
+		name := class.String()
+		if name == "unknown" {
+			t.Errorf("class %d renders as \"unknown\"", class)
+		}
+		if names[name] {
+			t.Errorf("duplicate class name %q", name)
+		}
+		names[name] = true
+	}
+	if len(names) != 3 {
+		t.Errorf("expected 3 distinct classes, got %d", len(names))
+	}
+	// An out-of-range value must degrade rather than index past the switch.
+	if got := terminationClass(99).String(); got != "unknown" {
+		t.Errorf("out-of-range class rendered as %q, want \"unknown\"", got)
+	}
+}
+
+// isKnownClass reports whether a class is one of the three.
+func isKnownClass(c terminationClass) bool {
+	return c == classReconnect || c == classCleanStop || c == classTerminal
+}
