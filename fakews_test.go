@@ -68,6 +68,15 @@ type epochScript struct {
 	closeAfter websocket.StatusCode
 	// closeReason accompanies closeAfter.
 	closeReason string
+	// closeAfterFrames, when non-zero, closes the connection once this many
+	// client frames have been received — the mid-stream close.
+	//
+	// It is distinct from closeAfter, which fires at the first opportunity.
+	// Cutting a connection *during* an exchange is a different fault from
+	// refusing it: a replay interrupted halfway leaves the client having
+	// received some records and no terminator, which is the case that separates
+	// "recovery was interrupted" from "recovery never started".
+	closeAfterFrames int
 }
 
 // recordedFrame is one frame the client sent.
@@ -233,16 +242,19 @@ func (f *fakeWS) serve(ctx context.Context, conn *websocket.Conn, epoch int, scr
 		}
 	}
 
-	if script.closeAfter != 0 && len(script.respond) == 0 {
+	// An immediate close: nothing to wait for, so drop the connection now.
+	if script.closeAfter != 0 && len(script.respond) == 0 && script.closeAfterFrames == 0 {
 		_ = conn.Close(script.closeAfter, script.closeReason)
 		return
 	}
 
+	var frames int
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
 			return // client closed, or the context ended
 		}
+		frames++
 
 		typ := messageType(data)
 		f.mu.Lock()
@@ -257,7 +269,18 @@ func (f *fakeWS) serve(ctx context.Context, conn *websocket.Conn, epoch int, scr
 			}
 		}
 
-		if script.closeAfter != 0 {
+		// Mid-stream close: the replies for this frame have been written, so the
+		// client has received a partial exchange and then loses the connection.
+		if script.closeAfterFrames != 0 && frames >= script.closeAfterFrames {
+			code := script.closeAfter
+			if code == 0 {
+				code = websocket.StatusAbnormalClosure
+			}
+			_ = conn.Close(code, script.closeReason)
+			return
+		}
+
+		if script.closeAfterFrames == 0 && script.closeAfter != 0 {
 			_ = conn.Close(script.closeAfter, script.closeReason)
 			return
 		}
@@ -447,6 +470,58 @@ func TestFakeWSClosesWithScriptedCode(t *testing.T) {
 	_, _, err = conn.Read(ctx)
 	if err == nil {
 		t.Fatal("read succeeded against a closed connection")
+	}
+	if got := websocket.CloseStatus(err); got != websocket.StatusPolicyViolation {
+		t.Errorf("close status = %v, want %v", got, websocket.StatusPolicyViolation)
+	}
+}
+
+// A mid-stream close cuts the connection after a scripted number of client
+// frames, once its replies have been written. It is a different fault from
+// refusing the connection: the client has received part of an exchange and then
+// loses the link, which is what separates "recovery was interrupted" from
+// "recovery never started".
+func TestFakeWSClosesMidStream(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeWS(t)
+	f.script(epochScript{
+		respond: map[string][]string{
+			// A replay that delivers one record and never terminates.
+			"replay": {frameMessage("acme.trades", 1, "kafka:7:41", `{}`)},
+		},
+		closeAfterFrames: 1,
+		closeAfter:       websocket.StatusPolicyViolation,
+		closeReason:      "cut mid-replay",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, f.URL(), &websocket.DialOptions{HTTPClient: f.client()})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	closeUpgradeBody(resp)
+	defer conn.CloseNow() //nolint:errcheck // best-effort teardown
+
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"replay","from_pos":"kafka:7:40"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The scripted record arrives...
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("reading the replayed record: %v", err)
+	}
+	if got := messageType(data); got != "message" {
+		t.Errorf("first frame = %q, want message", got)
+	}
+
+	// ...and then the connection is cut, with no terminator.
+	_, _, err = conn.Read(ctx)
+	if err == nil {
+		t.Fatal("the connection stayed open past the scripted mid-stream close")
 	}
 	if got := websocket.CloseStatus(err); got != websocket.StatusPolicyViolation {
 		t.Errorf("close status = %v, want %v", got, websocket.StatusPolicyViolation)
