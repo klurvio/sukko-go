@@ -234,3 +234,72 @@ func TestRateLimitErrorWithoutRetryAfter(t *testing.T) {
 		t.Errorf("message %q should still describe the failure without a Retry-After", msg)
 	}
 }
+
+// Retry-After has two legal encodings and a meaningful absence, and the SDK's
+// backoff behaves differently across all three. A test asserting only the
+// delta-seconds form would imply coverage it does not have.
+func TestParseRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name string
+		give string
+		want *time.Duration
+	}{
+		{"absent", "", nil},
+		{"delta seconds", "3", durationPtr(3 * time.Second)},
+		{"delta seconds with padding", "  30  ", durationPtr(30 * time.Second)},
+
+		// Zero is a real instruction — "retry immediately" — and must stay
+		// distinguishable from the header being absent. Collapsing the two
+		// would answer "retry now" with a full backoff.
+		{"delta seconds zero", "0", durationPtr(0)},
+
+		{"http date in the future", "Thu, 01 Jan 2026 12:00:30 GMT", durationPtr(30 * time.Second)},
+		// A date already past means retry now, not "ignore this".
+		{"http date in the past", "Thu, 01 Jan 2026 11:59:00 GMT", durationPtr(0)},
+
+		{"negative is not legal", "-5", nil},
+		{"garbage", "soon please", nil},
+		{"empty after trimming", "   ", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := parseRetryAfter(tc.give, now)
+
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("parseRetryAfter(%q) = %v, want nil (absent)", tc.give, *got)
+			case tc.want != nil && got == nil:
+				t.Errorf("parseRetryAfter(%q) = nil, want %v", tc.give, *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Errorf("parseRetryAfter(%q) = %v, want %v", tc.give, *got, *tc.want)
+			}
+		})
+	}
+}
+
+// The pointer return exists precisely so "absent" and "zero" stay distinct.
+// Asserting that directly keeps a future simplification to a plain Duration
+// from passing the table above by accident.
+func TestRetryAfterDistinguishesAbsentFromZero(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	absent := parseRetryAfter("", now)
+	zero := parseRetryAfter("0", now)
+
+	if absent != nil {
+		t.Error("an absent header must produce nil")
+	}
+	if zero == nil {
+		t.Fatal("a zero header must produce a non-nil zero duration, not nil")
+	}
+	if *zero != 0 {
+		t.Errorf("a zero header produced %v", *zero)
+	}
+}
+
+func durationPtr(d time.Duration) *time.Duration { return &d }

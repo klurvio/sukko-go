@@ -3,6 +3,9 @@ package sukko
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -330,3 +333,46 @@ func (e *TokenSourceError) Error() string {
 
 // Unwrap exposes the caller's own error.
 func (e *TokenSourceError) Unwrap() error { return e.Cause }
+
+// parseRetryAfter interprets a Retry-After header value.
+//
+// The header has two legal encodings, and the SDK honours both: a proxy, CDN or
+// ingress in front of the gateway can legitimately set either, and a value the
+// SDK cannot read is a backoff hint thrown away.
+//
+// It returns nil when the header is absent or unparseable, which is distinct
+// from a zero duration: "the server said nothing" and "the server said retry
+// immediately" are different instructions, and collapsing them into 0 would
+// silently answer "retry now" with a full exponential backoff. That distinction
+// is the reason the field is a pointer.
+//
+// now is passed in rather than read from the clock so the HTTP-date form is
+// computed against the SDK's own time source.
+func parseRetryAfter(value string, now time.Time) *time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+
+	// Delta-seconds: a non-negative integer count of seconds.
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds < 0 {
+			return nil // not a legal value; treat it as absent
+		}
+		d := time.Duration(seconds) * time.Second
+		return &d
+	}
+
+	// HTTP-date: an absolute instant. A date already in the past means "retry
+	// now", which is a real instruction rather than a malformed one, so it
+	// clamps to zero instead of being discarded.
+	if at, err := http.ParseTime(value); err == nil {
+		d := at.Sub(now)
+		if d < 0 {
+			d = 0
+		}
+		return &d
+	}
+
+	return nil
+}
