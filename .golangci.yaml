@@ -1,55 +1,220 @@
 # golangci-lint configuration (v2)
 # https://golangci-lint.run/usage/configuration/
 # Run: golangci-lint run ./...
+#
+# Adopted from the platform config (../sukko/.golangci.yaml) so the SDK and the
+# platform lint to the same bar. A few deltas, because the SDK is a pure client
+# library rather than a service (a fourth — a testingcontext exclusion for the
+# concurrency tests — is documented at its exclusion rule below):
+#   1. forbidigo messages say "slog", not "zerolog" — the SDK logs with log/slog
+#      (the platform uses zerolog; the SDK never does).
+#   2. protogetter / rowserrcheck / sqlclosecheck / paralleltest are NOT enabled:
+#      the SDK has no protobuf and no SQL, and paralleltest would demand
+#      t.Parallel() on the goleak- and shared-clock-based tests where it is
+#      forbidden (goleak inspects every process goroutine; a parallel sibling
+#      reads as a leak).
+#   3. Platform-only path exclusions (cmd/, testutil/, *.pb.go, _shared_test.go,
+#      _serial_test.go) are dropped — none exist here. The generic _test.go
+#      exclusions (which subsume the SDK's former G304-in-tests carve-out) stay.
 
 version: "2"
 
 run:
   timeout: 5m
   tests: true
-  go: "1.23"
+  go: "1.26"
 
 linters:
-  # Start from none; enable only what this SDK needs.
   default: none
   enable:
     # Core correctness
-    - errcheck # unchecked errors (constitution §III — no silent failures)
+    - errcheck
     - govet
     - ineffassign
-    - staticcheck # includes gosimple + stylecheck
-    - unused # no dead code (constitution §XI)
+    - staticcheck
+    - unused
 
-    # SDK-relevant additions
-    - bodyclose # HTTP response bodies are closed (REST/SSE/push)
-    - contextcheck # context.Context is threaded correctly
-    - durationcheck # duration multiplication mistakes (backoff/heartbeat)
-    - errorlint # correct %w error wrapping / errors.Is/As usage
-    - gosec # security checks (constitution §IX — redaction, TLS)
+    # Recommended
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - errorlint
+    - exhaustive
+    - gocritic
+    - gosec
     - misspell
-    - nilerr # returns nil where err != nil
-    - noctx # HTTP requests without a context
+    - nilerr
+    - noctx
     - prealloc
     - predeclared
     - revive
     - unconvert
     - unparam
+    - wastedassign
+
+    # Constitution-aligned
+    - wrapcheck # error wrapping at package boundaries (§III)
+    - forbidigo # ban fmt.Print / log.Print — slog only (§V)
+    - nolintlint # justification required for //nolint (§IX)
+
+    # Modernization
+    - copyloopvar
+    - intrange
+    - perfsprint
+    - usestdlibvars
+    - modernize
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+
+    exhaustive:
+      default-signifies-exhaustive: true
+
+    # §V: the SDK is library-quiet and logs with log/slog — never fmt.Print or
+    # the log package, and never zerolog (that is the platform's logger).
+    forbidigo:
+      forbid:
+        - pattern: ^fmt\.Print.*$
+          msg: "the SDK is library-quiet: use log/slog, never fmt.Print (§V)"
+        - pattern: ^log\.Print.*$
+          msg: "use log/slog, never the log package (§V)"
+        - pattern: ^log\.Fatal.*$
+          msg: "a library must not exit the process: use log/slog and return an error (§V)"
+        - pattern: ^log\.Panic.*$
+          msg: "a library must not panic the process: use log/slog and return an error (§V)"
+      analyze-types: true
+
+    # §IX: //nolint MUST carry a specific, explained justification.
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - hugeParam
+        - rangeValCopy
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+
+    misspell:
+      locale: US
+
+    prealloc:
+      simple: true
+      range-loops: true
+      for-loops: true
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+          disabled: true
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unused-parameter
+          disabled: true # covered by unparam
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1003", "-ST1016"]
+
+    unparam:
+      check-exported: false
+
+    # §III: errors from other packages are wrapped with context.
+    wrapcheck:
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Unwrap(
+        - errors.Join(
+        - .Wrap(
+        - .Wrapf(
+        - .WithMessage(
+        - .WithMessagef(
+        - .WithStack(
 
   exclusions:
     rules:
-      # G304 flags opening a file through a variable path, on the assumption the
-      # path could be attacker-controlled. In tests it never is: the conformance
-      # and fixture helpers walk this module's own testdata directory, and the
-      # only way to influence those paths is to already have commit access.
-      #
-      # Scoped to G304 in tests specifically. gosec stays active on runtime code,
-      # where paths do come from callers — loading a custom CA bundle is exactly
-      # the case this rule exists to catch.
+      # Test files: the same relaxations the platform grants — plus this is what
+      # subsumes the SDK's former test-scoped G304 carve-out.
       - path: _test\.go
         linters:
+          - errcheck
           - gosec
-        text: "G304"
+          - unparam
+          - prealloc
+          - wrapcheck
+          - forbidigo
+          - noctx
+
+      - path: _test\.go
+        text: "SA1019"
+
+      # The concurrency tests build their own cancellable contexts and cancel
+      # them MID-test to trigger discard/teardown paths. t.Context() is cancelled
+      # only at cleanup, so it cannot express that — modernize's testingcontext
+      # suggestion is wrong for these.
+      - path: _test\.go
+        text: "testingcontext"
+
+      - path: _test\.go
+        linters:
+          - govet
+        text: "unusedwrite"
 
 formatters:
   enable:
     - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+
+severity:
+  default: warning
+  rules:
+    - linters:
+        - gosec
+      severity: error
+    - linters:
+        - govet
+      severity: error
+    - linters:
+        - wrapcheck
+      severity: error
+    - linters:
+        - forbidigo
+      severity: error
+    - linters:
+        - nolintlint
+      severity: error

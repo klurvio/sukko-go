@@ -1,6 +1,6 @@
 module github.com/klurvio/sukko-go
 
-go 1.23.0
+go 1.26.1
 
 require go.uber.org/goleak v1.3.0
 
