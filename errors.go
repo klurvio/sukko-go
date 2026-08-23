@@ -147,25 +147,52 @@ func (e *RecoveryInterruptedError) Error() string {
 type AuthError struct {
 	// Code is the contract's auth error code, e.g. "invalid_token".
 	Code string
+	// Message is the server's human-readable description, when the frame
+	// carried one. The wire frame always may, so dropping it would discard
+	// diagnostics the server took the trouble to send.
+	Message string
 }
 
-func (e *AuthError) Error() string { return fmt.Sprintf("sukko: auth failed: %s", e.Code) }
+func (e *AuthError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("sukko: auth failed: %s: %s", e.Code, e.Message)
+	}
+	return "sukko: auth failed: " + e.Code
+}
 
 // PublishError reports a server-side publish rejection.
 type PublishError struct {
 	// Code is the contract's publish error code, e.g. "message_too_large".
 	Code string
+	// Message is the server's human-readable description, when present.
+	Message string
 }
 
-func (e *PublishError) Error() string { return fmt.Sprintf("sukko: publish rejected: %s", e.Code) }
+func (e *PublishError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("sukko: publish rejected: %s: %s", e.Code, e.Message)
+	}
+	return "sukko: publish rejected: " + e.Code
+}
 
-// HistoryError reports a server-side history rejection.
+// HistoryError reports a server-side history rejection. It carries the channel
+// because a history request names exactly one channel, and the contract marks
+// the field required on this frame.
 type HistoryError struct {
 	// Code is the contract's history error code, e.g. "history_disabled".
 	Code string
+	// Channel is the channel whose history request failed.
+	Channel string
+	// Message is the server's human-readable description, when present.
+	Message string
 }
 
-func (e *HistoryError) Error() string { return fmt.Sprintf("sukko: history failed: %s", e.Code) }
+func (e *HistoryError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("sukko: history failed on channel %s: %s: %s", e.Channel, e.Code, e.Message)
+	}
+	return fmt.Sprintf("sukko: history failed on channel %s: %s", e.Channel, e.Code)
+}
 
 // ReplayError reports a server-side replay rejection. It carries the channel
 // because the recovery engine is per-channel: an error that could not name its
@@ -176,9 +203,14 @@ type ReplayError struct {
 	Code string
 	// Channel is the channel whose replay failed.
 	Channel string
+	// Message is the server's human-readable description, when present.
+	Message string
 }
 
 func (e *ReplayError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("sukko: replay failed on channel %s: %s: %s", e.Channel, e.Code, e.Message)
+	}
 	return fmt.Sprintf("sukko: replay failed on channel %s: %s", e.Channel, e.Code)
 }
 
@@ -193,9 +225,16 @@ func (e *ReplayError) Is(target error) bool {
 type ReconnectError struct {
 	// Code is the contract's reconnect error code.
 	Code string
+	// Message is the server's human-readable description, when present.
+	Message string
 }
 
-func (e *ReconnectError) Error() string { return fmt.Sprintf("sukko: reconnect failed: %s", e.Code) }
+func (e *ReconnectError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("sukko: reconnect failed: %s: %s", e.Code, e.Message)
+	}
+	return "sukko: reconnect failed: " + e.Code
+}
 
 // Is bridges to ErrNotAvailable on the not_available code only, for the same
 // reason as ReplayError.
@@ -336,7 +375,7 @@ func (e *TokenSourceError) Unwrap() error { return e.Cause }
 
 // parseRetryAfter interprets a Retry-After header value.
 //
-// The header has two legal encodings, and the SDK honours both: a proxy, CDN or
+// The header has two legal encodings, and the SDK honors both: a proxy, CDN or
 // ingress in front of the gateway can legitimately set either, and a value the
 // SDK cannot read is a backoff hint thrown away.
 //
@@ -367,10 +406,7 @@ func parseRetryAfter(value string, now time.Time) *time.Duration {
 	// now", which is a real instruction rather than a malformed one, so it
 	// clamps to zero instead of being discarded.
 	if at, err := http.ParseTime(value); err == nil {
-		d := at.Sub(now)
-		if d < 0 {
-			d = 0
-		}
+		d := max(at.Sub(now), 0)
 		return &d
 	}
 

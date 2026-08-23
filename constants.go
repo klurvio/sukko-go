@@ -8,7 +8,7 @@ package sukko
 // mirrors `history_complete.source`, MessageSource is carried on delivered
 // messages), so the type encodes and decodes as the right JSON string with no
 // conversion table to drift. The zero value is the empty string, which is not a
-// valid member of any of these sets — an unset field is recognisable rather than
+// valid member of any of these sets — an unset field is recognizable rather than
 // silently valid — with ConnectionState the one exception, noted below.
 
 // ConnectionState is the client's observable lifecycle state, reported by
@@ -31,7 +31,7 @@ const (
 	// StateConnected is set once the handshake succeeds and delivery is live.
 	StateConnected ConnectionState = "connected"
 	// StateReconnecting is set while the supervisor is backing off and
-	// re-dialling after a reconnect-class epoch termination.
+	// re-dialing after a reconnect-class epoch termination.
 	StateReconnecting ConnectionState = "reconnecting"
 	// StateError is the terminal state for a failure the SDK will not retry.
 	// Client.Err is non-nil in this state.
@@ -67,6 +67,12 @@ func (s MessageSource) String() string { return string(s) }
 
 // HistorySource reports where a completed history response was served from.
 // The values mirror the contract's `history_complete.source` enum.
+//
+// A caller switching on it MUST include a default: like an error code, the SDK
+// surfaces the server's value verbatim, so a server newer than this SDK may
+// deliver a source outside the constants below rather than have the frame
+// rejected. Compare against the named constants and treat anything else as
+// unknown.
 type HistorySource string
 
 const (

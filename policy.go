@@ -4,7 +4,7 @@ package sukko
 // can end, and the state machine those endings drive.
 //
 // They are data, not code, for one reason: the test matrices that assert
-// termination behaviour and state-change events are generated from these
+// termination behavior and state-change events are generated from these
 // structures. A table and its matrix therefore cannot drift — adding a row adds
 // its test case. The tables claim to be exhaustive, so a termination that is not
 // enumerated here is a defect in the enumeration, not an unhandled case.
@@ -231,7 +231,7 @@ const (
 	// triggerConnectCalled is the caller invoking Connect.
 	triggerConnectCalled trigger = iota
 	// triggerCloseCalled is the caller invoking Close, or the client-lifetime
-	// context being cancelled.
+	// context being canceled.
 	triggerCloseCalled
 	// triggerHandshakeOK is a completed handshake and initial auth.
 	triggerHandshakeOK
@@ -241,7 +241,7 @@ const (
 	// giving up while reconnecting.
 	triggerTerminalFailure
 	// triggerDialAborted is a dial cut short by the caller's own context — the
-	// Connect(ctx) deadline expiring or the caller cancelling mid-dial. It is
+	// Connect(ctx) deadline expiring or the caller canceling mid-dial. It is
 	// classified exactly like any other non-terminal dial failure; without it a
 	// client whose Connect deadline expired parked in connecting forever with no
 	// dial in flight, no *Terminal, and an open channel.

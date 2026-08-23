@@ -18,8 +18,8 @@ func TestTimerPurposesAreClosedAndUnique(t *testing.T) {
 	t.Parallel()
 
 	purposes := allTimerPurposes()
-	if len(purposes) != 11 {
-		t.Errorf("expected 11 timer purposes, got %d", len(purposes))
+	if len(purposes) != 12 {
+		t.Errorf("expected 12 timer purposes, got %d", len(purposes))
 	}
 
 	seen := make(map[timerPurpose]bool, len(purposes))
@@ -39,6 +39,7 @@ func TestTimerPurposesAreClosedAndUnique(t *testing.T) {
 		purposeBackoff, purposeHeartbeat, purposePong, purposeRefresh,
 		purposeReplayFloor, purposeRecoveryDeadline, purposeAckTimeout,
 		purposeBlockedWarn, purposeTokenSource, purposeSSEIdle, purposeDial,
+		purposeDeliveryProbe,
 	} {
 		if !seen[want] {
 			t.Errorf("timer purpose %q is missing from the closed list", want)

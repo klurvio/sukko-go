@@ -135,7 +135,7 @@ func TestEnumJSONRoundTrip(t *testing.T) {
 				t.Fatalf("%s: marshal: %v", tc.name, err)
 			}
 			if string(got) != tc.want {
-				t.Errorf("%s marshalled to %s, want %s", tc.name, got, tc.want)
+				t.Errorf("%s marshaled to %s, want %s", tc.name, got, tc.want)
 			}
 		}
 	})

@@ -1,6 +1,7 @@
 package sukko
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -18,12 +19,12 @@ import (
 // Message.Channel and the recovery cursor map all take and return strings.
 // Channel is a parse/validation helper for callers who want the split view, not
 // a type threaded through the API — that would force conversions on the hot
-// path for safety the wire cannot honour anyway.
+// path for safety the wire cannot honor anyway.
 
 // ErrInvalidChannel reports a channel that does not satisfy the format. It is a
 // sentinel so a caller can branch on "this channel is malformed" without
 // matching on message text.
-var ErrInvalidChannel = fmt.Errorf("sukko: invalid channel")
+var ErrInvalidChannel = errors.New("sukko: invalid channel")
 
 // Channel is the split view of a channel string.
 type Channel struct {

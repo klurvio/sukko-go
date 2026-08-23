@@ -38,7 +38,7 @@ func TestExactlyOneRuntimeDependency(t *testing.T) {
 
 	std := stdlibPackages(t)
 	external := map[string]bool{}
-	for _, pkg := range strings.Fields(string(out)) {
+	for pkg := range strings.FieldsSeq(string(out)) {
 		if pkg == "github.com/klurvio/sukko-go" || std[pkg] {
 			continue
 		}
@@ -67,7 +67,7 @@ func TestExactlyOneRuntimeDependency(t *testing.T) {
 
 // TestNoPlatformRepoDependency pins the module boundary.
 //
-// The SDK derives its behaviour from the published contracts, never from the
+// The SDK derives its behavior from the published contracts, never from the
 // platform's own source. Go's internal/ rule already blocks importing the
 // server's protocol package, but nothing blocks importing some other part of
 // the platform module — and doing so would couple an independently-released
@@ -81,9 +81,9 @@ func TestNoPlatformRepoDependency(t *testing.T) {
 		t.Fatalf("go list -deps: %v", err)
 	}
 
-	for _, pkg := range strings.Fields(string(out)) {
+	for pkg := range strings.FieldsSeq(string(out)) {
 		if strings.Contains(pkg, "klurvio/sukko/") || pkg == "github.com/klurvio/sukko" {
-			t.Errorf("imports the platform module (%s); the SDK must derive behaviour from the contracts alone", pkg)
+			t.Errorf("imports the platform module (%s); the SDK must derive behavior from the contracts alone", pkg)
 		}
 	}
 }
@@ -95,7 +95,7 @@ func TestNoPlatformRepoDependency(t *testing.T) {
 // a logger the caller supplied, so it must never call slog.SetDefault, and must
 // never hold a package-level logger that could be used without one being passed.
 //
-// This is the source half of the guarantee; the behavioural half — running a
+// This is the source half of the guarantee; the behavioral half — running a
 // full lifecycle with no logger configured and asserting nothing is emitted —
 // belongs with the client tests, where there is a lifecycle to run.
 func TestLibraryIsQuietByDefault(t *testing.T) {
@@ -196,7 +196,7 @@ func TestClockIsTheOnlyTimeSource(t *testing.T) {
 // ─── helpers ───
 
 // forEachNonTestFile parses every non-test Go file in the package and hands it
-// to fn. The guards inspect source rather than behaviour because they are
+// to fn. The guards inspect source rather than behavior because they are
 // asserting an absence, and an absence has no runtime signal to observe.
 func forEachNonTestFile(t *testing.T, fn func(path string, file *ast.File, fset *token.FileSet)) {
 	t.Helper()
@@ -258,7 +258,7 @@ func stdlibPackages(t *testing.T) map[string]bool {
 		t.Fatalf("go list std: %v", err)
 	}
 	set := map[string]bool{}
-	for _, pkg := range strings.Fields(string(out)) {
+	for pkg := range strings.FieldsSeq(string(out)) {
 		set[pkg] = true
 	}
 	return set

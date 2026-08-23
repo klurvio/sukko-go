@@ -249,17 +249,17 @@ func TestParseRetryAfter(t *testing.T) {
 		want *time.Duration
 	}{
 		{"absent", "", nil},
-		{"delta seconds", "3", durationPtr(3 * time.Second)},
-		{"delta seconds with padding", "  30  ", durationPtr(30 * time.Second)},
+		{"delta seconds", "3", new(3 * time.Second)},
+		{"delta seconds with padding", "  30  ", new(30 * time.Second)},
 
 		// Zero is a real instruction — "retry immediately" — and must stay
 		// distinguishable from the header being absent. Collapsing the two
 		// would answer "retry now" with a full backoff.
-		{"delta seconds zero", "0", durationPtr(0)},
+		{"delta seconds zero", "0", new(time.Duration(0))},
 
-		{"http date in the future", "Thu, 01 Jan 2026 12:00:30 GMT", durationPtr(30 * time.Second)},
+		{"http date in the future", "Thu, 01 Jan 2026 12:00:30 GMT", new(30 * time.Second)},
 		// A date already past means retry now, not "ignore this".
-		{"http date in the past", "Thu, 01 Jan 2026 11:59:00 GMT", durationPtr(0)},
+		{"http date in the past", "Thu, 01 Jan 2026 11:59:00 GMT", new(time.Duration(0))},
 
 		{"negative is not legal", "-5", nil},
 		{"garbage", "soon please", nil},
@@ -301,5 +301,3 @@ func TestRetryAfterDistinguishesAbsentFromZero(t *testing.T) {
 		t.Errorf("a zero header produced %v", *zero)
 	}
 }
-
-func durationPtr(d time.Duration) *time.Duration { return &d }

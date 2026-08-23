@@ -2,6 +2,7 @@ package sukko
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -25,7 +26,7 @@ import (
 // Token is a credential and, optionally, when it expires.
 //
 // A zero Expiry means "unknown": the SDK falls back to the expiry the server
-// reports at auth time, which is the default behaviour and costs a caller
+// reports at auth time, which is the default behavior and costs a caller
 // nothing. A non-zero Expiry is caller-authoritative and lets the refresh
 // scheduler arm without waiting for a round-trip — which matters most when the
 // server reports no expiry at all, where there would otherwise be nothing to
@@ -307,7 +308,7 @@ func (c *config) validate(rawURL string) error {
 // input — see WithInsecureTransport.
 func (c *config) validateURL(rawURL string) error {
 	if rawURL == "" {
-		return fmt.Errorf("sukko: url is empty")
+		return errors.New("sukko: url is empty")
 	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -346,15 +347,15 @@ func (c *config) validateCredentials() error {
 	hasCredential := c.token != "" || c.apiKey != "" || c.tokenSource != nil
 
 	if c.noAuth && hasCredential {
-		return fmt.Errorf("sukko: WithNoAuth cannot be combined with a credential; " +
+		return errors.New("sukko: WithNoAuth cannot be combined with a credential; " +
 			"a client that both has a credential and declares auth disabled has two meanings")
 	}
 	if c.noAuth && c.queryParamAuth {
-		return fmt.Errorf("sukko: WithNoAuth cannot be combined with WithQueryParamAuth; " +
+		return errors.New("sukko: WithNoAuth cannot be combined with WithQueryParamAuth; " +
 			"there is no credential to place in the query string")
 	}
 	if !c.noAuth && !hasCredential {
-		return fmt.Errorf("sukko: no credential configured; " +
+		return errors.New("sukko: no credential configured; " +
 			"pass WithToken, WithAPIKey or WithTokenSource, or WithNoAuth if the deployment has auth disabled")
 	}
 	return nil
@@ -393,16 +394,16 @@ func (c *config) validateBounds() error {
 		return fmt.Errorf("sukko: unknown transport %q", c.transport)
 
 	case c.httpClient == nil:
-		return fmt.Errorf("sukko: WithHTTPClient requires a non-nil client")
+		return errors.New("sukko: WithHTTPClient requires a non-nil client")
 
 	case c.logger == nil:
-		return fmt.Errorf("sukko: WithLogger requires a non-nil logger")
+		return errors.New("sukko: WithLogger requires a non-nil logger")
 
 	case c.clock == nil:
-		return fmt.Errorf("sukko: WithClock requires a non-nil clock")
+		return errors.New("sukko: WithClock requires a non-nil clock")
 
 	case c.rand == nil:
-		return fmt.Errorf("sukko: WithRand requires a non-nil source")
+		return errors.New("sukko: WithRand requires a non-nil source")
 	}
 
 	for _, d := range []struct {

@@ -146,7 +146,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 		case f.t.ch <- f.at:
 		default:
 			// A previous fire is still unread. Dropping matches time.Ticker's
-			// own behaviour for a slow receiver.
+			// own behavior for a slow receiver.
 		}
 	}
 }
@@ -235,7 +235,7 @@ func (r *fakeRand) draws() int {
 
 // ─── harness self-tests ───
 //
-// The harness is load-bearing for every later phase, so its own behaviour is
+// The harness is load-bearing for every later phase, so its own behavior is
 // asserted here rather than assumed.
 
 func TestFakeClockAdvanceFiresDueTimers(t *testing.T) {
@@ -348,7 +348,7 @@ func TestFakeClockBlockUntilTimerIsPerPurpose(t *testing.T) {
 	// Release the waiter before returning. Leaving it parked would abandon a
 	// goroutine for the rest of the run — which the package's own leak check
 	// duly reports, and which would be this test lecturing the SDK about
-	// lifecycle hygiene while not practising it.
+	// lifecycle hygiene while not practicing it.
 	c.NewTimer(time.Second, purposeRefresh)
 	select {
 	case <-released:
@@ -366,7 +366,7 @@ func TestFakeClockTickerRepeats(t *testing.T) {
 
 	// One advance spanning three intervals fires the ticker each time; the
 	// channel holds the most recent, matching time.Ticker's slow-receiver
-	// behaviour.
+	// behavior.
 	c.Advance(3 * time.Second)
 	select {
 	case <-ticker.C():

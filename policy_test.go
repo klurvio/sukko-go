@@ -128,7 +128,7 @@ func TestHandshakePolicyClassification(t *testing.T) {
 }
 
 // The 429 row is the only handshake outcome whose Retry-After overrides the
-// computed backoff delay, so the flag that carries that behaviour is pinned
+// computed backoff delay, so the flag that carries that behavior is pinned
 // separately from the class.
 func TestHandshakePolicyRetryAfterOverride(t *testing.T) {
 	t.Parallel()
@@ -137,7 +137,7 @@ func TestHandshakePolicyRetryAfterOverride(t *testing.T) {
 		t.Error("a handshake 429 must let a non-nil Retry-After override the backoff delay")
 	}
 	if got := lookupHandshakePolicy(503, "", true); got.retryAfterOverrides {
-		t.Error("only the 429 row honours Retry-After as a backoff override")
+		t.Error("only the 429 row honors Retry-After as a backoff override")
 	}
 }
 

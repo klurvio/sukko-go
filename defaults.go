@@ -92,7 +92,7 @@ const (
 
 	// DefaultReplayFloor is the per-channel floor between live replay requests,
 	// tracking the server's WS_REPLAY_RATE_LIMIT_INTERVAL. The automatic
-	// gap-to-replay path honours it rather than provoking replay_rate_limited.
+	// gap-to-replay path honors it rather than provoking replay_rate_limited.
 	DefaultReplayFloor = 10 * time.Second
 
 	// DefaultRecoveryDeadline is how long the client waits for a recovery

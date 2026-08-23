@@ -2,6 +2,7 @@ package sukko
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -74,7 +75,7 @@ type wireSubscribe struct {
 // subscribePayload carries the multi-channel form. The contract's second mode
 // (a single `channel` plus an inline `history` request) is deliberately not
 // represented: History covers that capability with a simpler surface, and
-// modelling both here would make `channels` and `channel` dual-purpose, which
+// modeling both here would make `channels` and `channel` dual-purpose, which
 // §IX forbids. The omission is recorded against the contract's own example in
 // contract_examples_test.go rather than left implicit.
 type subscribePayload struct {
@@ -96,7 +97,7 @@ type wirePublish struct {
 }
 
 // publishPayload nests the caller's own payload under a second `data`. The
-// doubling is the contract's, not an accident of modelling: the outer `data` is
+// doubling is the contract's, not an accident of modeling: the outer `data` is
 // the envelope the server routes on, the inner one is opaque application content
 // the SDK never inspects.
 type publishPayload struct {
@@ -168,7 +169,7 @@ type replayPayload struct {
 // Pos is a plain string with omitempty, and the distinction between absent and
 // empty is handled by never storing an empty cursor rather than by a pointer:
 // the SDK's rule is that an empty cursor anchors nothing, so "" and absent lead
-// to the same behaviour. History marks a record as part of a history response;
+// to the same behavior. History marks a record as part of a history response;
 // its absence decodes to false, which is correct — a record that says nothing
 // about history is not a history record.
 type wireMessage struct {
@@ -436,7 +437,7 @@ var sendRegistry = map[string]func() any{
 //
 //   - A known type decodes to its struct.
 //   - An unknown type is reported as unknown, not as an error. A server may be
-//     newer than its clients, and a client that failed on an unrecognised frame
+//     newer than its clients, and a client that failed on an unrecognized frame
 //     could never be deployed ahead of a server upgrade.
 //   - A known type that will not decode is a protocol error, surfaced rather
 //     than dropped so contract drift is visible instead of silent.
@@ -460,7 +461,7 @@ func decodeFrame(data []byte) (decoded any, unknownType string, err error) {
 		return nil, "", fmt.Errorf("sukko: frame could not be read as a typed envelope: %w", e)
 	}
 	if env.Type == "" {
-		return nil, "", fmt.Errorf("sukko: frame has no type field")
+		return nil, "", errors.New("sukko: frame has no type field")
 	}
 
 	construct, known := decodeRegistry[env.Type]
@@ -488,7 +489,7 @@ func decodeFrame(data []byte) (decoded any, unknownType string, err error) {
 // two meanings depending on when it arrived.
 func classifyErrorFrame(frame *wireError) error {
 	if frame.Channel != "" {
-		return &ReplayError{Code: frame.Code, Channel: frame.Channel}
+		return &ReplayError{Code: frame.Code, Channel: frame.Channel, Message: frame.Message}
 	}
 	return &ProtocolError{Type: typeError, Code: frame.Code, Message: frame.Message}
 }

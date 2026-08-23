@@ -27,8 +27,6 @@ import (
 // test that used "secret123" would not exercise the patterns that matter, and
 // would pass while leaving a realistic token untouched. Neither value has ever
 // been valid anywhere.
-//
-//nolint:gosec // G101: deliberately credential-shaped test fixtures, never real.
 const (
 	testJWT    = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl"
 	testAPIKey = "sk_live_9f8e7d6c5b4a3210"
@@ -129,7 +127,6 @@ func TestRedactsPushSubscriberKeys(t *testing.T) {
 
 	// Web Push key material, in the real encoding. Synthetic, never valid.
 	//
-	//nolint:gosec // G101: deliberately credential-shaped test fixtures, never real.
 	const (
 		p256dh = "BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U"
 		secret = "tBHItJI5svbpez7KI4CCXg"

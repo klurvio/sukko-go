@@ -28,7 +28,7 @@ func TestGoldenFixturesDecode(t *testing.T) {
 				t.Fatalf("decode failed: %v", err)
 			}
 			if unknown != "" {
-				t.Fatalf("type %q was not recognised, but it is in the registry", unknown)
+				t.Fatalf("type %q was not recognized, but it is in the registry", unknown)
 			}
 
 			reencoded := mustMarshal(t, decoded)
@@ -124,7 +124,7 @@ func TestMalformedFramesAreReported(t *testing.T) {
 }
 
 // TestUnknownTypeIsNotAnError covers the forward-compatibility rule: a server
-// may be newer than its clients, so an unrecognised type is reported as unknown
+// may be newer than its clients, so an unrecognized type is reported as unknown
 // rather than failing. A client that errored here could never be deployed ahead
 // of a server upgrade.
 func TestUnknownTypeIsNotAnError(t *testing.T) {
@@ -273,7 +273,7 @@ func TestOptionalFieldSemantics(t *testing.T) {
 
 	t.Run("auth_ack exp zero means non-expiring", func(t *testing.T) {
 		// Not a missing value: a credential with no expiry is a real case the
-		// refresh scheduler must recognise rather than treat as expired-at-epoch.
+		// refresh scheduler must recognize rather than treat as expired-at-epoch.
 		ack := decodeAs[*wireAuthAck](t, `{"type":"auth_ack","data":{"exp":0}}`)
 		if ack.Data.Exp != 0 {
 			t.Errorf("exp = %d, want 0", ack.Data.Exp)
@@ -450,7 +450,7 @@ func TestSendFramesEncodeToContractShape(t *testing.T) {
 		{
 			name: "publish",
 			// The caller's payload nests under a second `data` — the contract's
-			// doubling, not a modelling accident.
+			// doubling, not a modeling accident.
 			frame: wirePublish{Type: typePublish, Data: publishPayload{Channel: "acme.orders.eu", Data: json.RawMessage(`{"id":1}`)}},
 			want:  `{"type":"publish","data":{"channel":"acme.orders.eu","data":{"id":1}}}`,
 		},
@@ -564,7 +564,7 @@ func decodeAs[T any](t *testing.T, frame string) T {
 		t.Fatalf("decode failed: %v", err)
 	}
 	if unknown != "" {
-		t.Fatalf("type %q was not recognised", unknown)
+		t.Fatalf("type %q was not recognized", unknown)
 	}
 
 	typed, ok := decoded.(T)

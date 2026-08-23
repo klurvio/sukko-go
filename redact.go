@@ -166,6 +166,7 @@ func (h *redactingHandler) Handle(ctx context.Context, record slog.Record) error
 		clone.AddAttrs(h.redactor.redactAttr(attr))
 		return true
 	})
+	//nolint:wrapcheck // slog.Handler.Handle passthrough: the delegate's error is returned verbatim per the Handler contract; wrapping would change what slog's internals receive.
 	return h.base.Handle(ctx, clone)
 }
 

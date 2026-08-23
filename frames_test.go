@@ -2,6 +2,7 @@ package sukko
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ import (
 // never expires — look like ordinary frames until someone reads them closely.
 // A named builder puts the intent in the name.
 //
-// These emit strings rather than marshalling the SDK's own wire structs
+// These emit strings rather than marshaling the SDK's own wire structs
 // deliberately: a fixture that shares the encoder with the code under test
 // cannot catch an encoder that is wrong in both places.
 
@@ -171,7 +172,7 @@ func frameMalformed() string { return `{"type":"message",,,}` }
 
 // retryAfterSeconds is the delta-seconds form.
 func retryAfterSeconds(d time.Duration) string {
-	return fmt.Sprintf("%d", int(d.Seconds()))
+	return strconv.Itoa(int(d.Seconds()))
 }
 
 // retryAfterHTTPDate is the absolute-date form, expressed relative to a base so

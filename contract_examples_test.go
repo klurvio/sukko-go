@@ -20,7 +20,7 @@ import (
 // looks like — and require each wire struct to reproduce one exactly.
 //
 // That distinction is not academic. A struct can round-trip a hand-written
-// fixture perfectly while modelling a field the server never sends, or missing
+// fixture perfectly while modeling a field the server never sends, or missing
 // the nesting the server requires, and no amount of internal consistency will
 // reveal it.
 
@@ -97,7 +97,7 @@ type contractExample struct {
 var skippedExamples = map[string]string{
 	"subscribeWithHistory": "the contract's second subscribe mode (single channel + inline history) " +
 		"is not implemented: History() covers the capability with a simpler surface, and a field the " +
-		"SDK never sets is a field that cannot be exercised. Modelling both modes in one struct would " +
+		"SDK never sets is a field that cannot be exercised. Modeling both modes in one struct would " +
 		"make `channels` and `channel` dual-purpose, which §IX forbids.",
 
 	"heartbeatExample": "heartbeat is the one send frame whose `data` the contract marks optional " +

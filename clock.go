@@ -47,6 +47,12 @@ const (
 	purposeSSEIdle timerPurpose = "sse_idle"
 	// purposeDial bounds a reconnect dial.
 	purposeDial timerPurpose = "dial"
+	// purposeDeliveryProbe re-checks the delivery channel's class ceiling while a
+	// send is parked on back-pressure. A raw channel gives no receive hook, so a
+	// blocked send cannot be woken precisely on drain; it re-probes on this timer
+	// instead (ADR-0006). It supersedes NFR-005's aside that a blocked channel
+	// send involves no timer.
+	purposeDeliveryProbe timerPurpose = "delivery_probe"
 )
 
 // allTimerPurposes returns the closed set, for exhaustiveness checks.
@@ -55,6 +61,7 @@ func allTimerPurposes() []timerPurpose {
 		purposeBackoff, purposeHeartbeat, purposePong, purposeRefresh,
 		purposeReplayFloor, purposeRecoveryDeadline, purposeAckTimeout,
 		purposeBlockedWarn, purposeTokenSource, purposeSSEIdle, purposeDial,
+		purposeDeliveryProbe,
 	}
 }
 
