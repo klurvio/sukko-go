@@ -1,0 +1,227 @@
+package sukko
+
+import (
+	"context"
+	"fmt"
+	"iter"
+	"sync"
+)
+
+// Client is a connection to the Sukko platform. It is single-use: after Close
+// (or a terminal failure) every method returns ErrClosed, including Connect —
+// build a new client to reconnect from scratch.
+//
+// The public API lives here; the supervisor goroutine that owns the connection
+// lifecycle is in supervisor.go, as methods on this same struct.
+type Client struct {
+	cfg   *config
+	clock Clock
+
+	transport Transport
+	delivery  *delivery
+	counters  *counters
+
+	// rootCtx is the client-lifetime context: canceling it tears the client
+	// down exactly as Close does. rootCancel is that cancel.
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+
+	// firstDial carries the first dial's outcome from the supervisor to Connect.
+	// Buffered so the supervisor never blocks on it even if Connect has already
+	// returned on its own context deadline.
+	firstDial chan error
+	// doneCh is closed by terminalSequence when teardown is complete.
+	doneCh chan struct{}
+	// terminalOnce guards the whole terminal sequence: it runs once whether the
+	// supervisor's exit or a never-connected Close reaches it.
+	terminalOnce sync.Once
+
+	// mu guards the fields below.
+	mu      sync.Mutex
+	state   ConnectionState
+	err     error
+	conn    Conn
+	started bool // the supervisor was launched (Connect called)
+	closed  bool // Close was called
+}
+
+// NewClient builds a client for a URL. It validates the configuration and fails
+// fast; it does not dial — call Connect for that. The context is the client
+// lifetime: canceling it tears the client down like Close.
+func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error) {
+	cfg := defaultConfig()
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if err := cfg.validate(url); err != nil {
+		return nil, err
+	}
+
+	rootCtx, rootCancel := context.WithCancel(ctx)
+	counters := &counters{}
+
+	c := &Client{
+		cfg:        cfg,
+		clock:      cfg.clock,
+		transport:  newWSTransport(url, cfg),
+		delivery:   newDelivery(cfg.queueSize, cfg.clock, counters),
+		counters:   counters,
+		rootCtx:    rootCtx,
+		rootCancel: rootCancel,
+		firstDial:  make(chan error, 1),
+		doneCh:     make(chan struct{}),
+		state:      StateDisconnected,
+	}
+
+	// Canceling the client-lifetime context tears the client down like Close.
+	// When a supervisor is running it already watches rootCtx (via the epoch
+	// context); when Close ran it already tore down. This handles the remaining
+	// case — the lifetime canceled before Connect — so Messages() still closes
+	// and a ranging caller is not stranded.
+	context.AfterFunc(rootCtx, c.onLifetimeCancel)
+
+	return c, nil
+}
+
+// onLifetimeCancel tears down a client whose lifetime context was canceled
+// before a supervisor ever ran. It defers to a running supervisor or a
+// concurrent Close: the started/closed check under mu is the same handshake
+// Connect and Close use, so exactly one path performs the teardown.
+func (c *Client) onLifetimeCancel() {
+	c.mu.Lock()
+	if c.started || c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.mu.Unlock()
+
+	c.transition(context.Background(), triggerCloseCalled)
+	c.terminalSequence()
+}
+
+// Connect starts the connection. The context bounds the first dial and handshake
+// only — it is not retained, so a Connect(ctx) whose deadline passes after a
+// successful handshake does not tear down the live connection. Connect returns
+// the first dial's outcome: nil on success, a typed error otherwise.
+func (c *Client) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	switch {
+	case c.closed || c.state == StateClosed || c.state == StateError:
+		c.mu.Unlock()
+		return ErrClosed
+	case c.started:
+		c.mu.Unlock()
+		return ErrAlreadyConnected
+	case c.rootCtx.Err() != nil:
+		// The client lifetime was already canceled.
+		c.mu.Unlock()
+		return ErrClosed
+	}
+	c.started = true
+	c.mu.Unlock()
+
+	go c.run(ctx)
+
+	select {
+	case err := <-c.firstDial:
+		return err
+	case <-c.doneCh:
+		// The supervisor exited before reporting a dial outcome (e.g. a panic in
+		// the dial path). Report the terminal cause rather than block forever.
+		return c.Err()
+	case <-ctx.Done():
+		return fmt.Errorf("sukko: connect: %w", ctx.Err())
+	}
+}
+
+// Close tears the client down and waits, bounded by ctx, for the teardown to
+// finish. It is idempotent: a second Close returns nil. Canceling the
+// client-lifetime context has the same effect.
+func (c *Client) Close(ctx context.Context) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		<-c.waitOrCtx(ctx) // still honor the caller's wait on an in-flight close
+		return nil
+	}
+	c.closed = true
+	started := c.started
+	c.mu.Unlock()
+
+	c.rootCancel()
+
+	// If no supervisor ever ran, nobody else will perform the terminal sequence,
+	// so Close does it. started cannot flip to true after closed is set, so
+	// there is no orphaned supervisor.
+	if !started {
+		//nolint:contextcheck // no epoch context exists on the never-connected close path; Background is the correct empty parent.
+		c.transition(context.Background(), triggerCloseCalled)
+		c.terminalSequence()
+	}
+
+	select {
+	case <-c.doneCh:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("sukko: close: %w", ctx.Err())
+	}
+}
+
+// waitOrCtx returns a channel that closes when teardown finishes or ctx ends —
+// used by the idempotent second-Close path.
+func (c *Client) waitOrCtx(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-c.doneCh:
+		case <-ctx.Done():
+		}
+		close(done)
+	}()
+	return done
+}
+
+// State returns the current connection state.
+func (c *Client) State() ConnectionState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state
+}
+
+// Err returns the terminal cause after Messages() has closed: nil after a clean
+// stop (Close or lifetime cancellation), the failure otherwise. The channel
+// close is the happens-before edge that makes it race-free to read after close.
+func (c *Client) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+// Messages returns the in-band event stream. It is closed once, by the
+// supervisor, after the final *Terminal.
+func (c *Client) Messages() <-chan Event { return c.delivery.messages() }
+
+// Iter yields events until the caller's context ends or Messages() closes. It
+// receives and yields in the same step, so an abandoned range strands no event.
+func (c *Client) Iter(ctx context.Context) iter.Seq[Event] {
+	return func(yield func(Event) bool) {
+		msgs := c.delivery.messages()
+		for {
+			select {
+			case ev, ok := <-msgs:
+				if !ok || !yield(ev) {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// Stats returns an eventually-consistent snapshot of the client's counters.
+func (c *Client) Stats() Stats { return c.counters.snapshot() }
+
+// Capabilities reports what the client's transport can do.
+func (c *Client) Capabilities() Capabilities { return c.transport.Capabilities() }

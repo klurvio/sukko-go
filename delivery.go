@@ -87,6 +87,11 @@ func newDelivery(queueSize int, clock Clock, c *counters) *delivery {
 // messages returns the receive end for the caller.
 func (d *delivery) messages() <-chan Event { return d.ch }
 
+// close closes the delivery channel. It is called exactly once, by the
+// supervisor's terminal sequence, after every sender has exited — so no send can
+// race the close.
+func (d *delivery) close() { close(d.ch) }
+
 // safetySubset are the reserve-eligible event types (FR-001a). Each member's
 // per-epoch volume is bounded by SDK-owned state, not by caller or server
 // volume, which is what makes 15 slots ≥2× the worst-case demand.

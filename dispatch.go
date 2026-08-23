@@ -1,6 +1,16 @@
 package sukko
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// errNotSurfaceFrame is returned by surfaceEvent for a frame whose disposition
+// is not dispSurface — a client-derived or internal-silent control frame that
+// the decode loop handles by its side effect, not by surfacing an event. The
+// decode loop distinguishes it from a presence/protocol error (which IS
+// surfaced) with errors.Is.
+var errNotSurfaceFrame = errors.New("sukko: frame is not a surface-disposition frame")
 
 // The wire→event mapping: FR-001a's dispatch table in code.
 //
@@ -203,7 +213,7 @@ func surfaceEvent(decoded any) (Event, error) {
 		return classifyErrorFrame(f).(Event), nil
 
 	default:
-		return nil, fmt.Errorf("sukko: %T is not a surface-disposition frame", decoded)
+		return nil, fmt.Errorf("%w: %T", errNotSurfaceFrame, decoded)
 	}
 }
 
