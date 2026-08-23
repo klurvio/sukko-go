@@ -3,6 +3,7 @@ package sukko
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -21,7 +22,7 @@ import (
 // what goes wrong.
 //
 // Two capabilities shape the design. First, scripting is **per epoch, looked up
-// by dial count**: reconnect behaviour is most of what this SDK does, and
+// by dial count**: reconnect behavior is most of what this SDK does, and
 // asserting it needs connect #1 and connect #2 to differ deterministically.
 // Second, every frame the client sends is **recorded**, because most recovery
 // assertions are about what the client did — "exactly one reconnect frame", "no
@@ -36,7 +37,7 @@ type fakeWS struct {
 	mu sync.Mutex
 	// dials counts upgrade attempts, and indexes the per-epoch script.
 	dials int
-	// scripts holds per-epoch behaviour; scripts[0] drives the first dial.
+	// scripts holds per-epoch behavior; scripts[0] drives the first dial.
 	// The final entry repeats for every later epoch, so a test scripting one
 	// epoch does not have to enumerate reconnects it does not care about.
 	scripts []epochScript
@@ -55,7 +56,7 @@ type fakeWS struct {
 	stallUpgrade chan struct{}
 }
 
-// epochScript describes one connection's behaviour.
+// epochScript describes one connection's behavior.
 type epochScript struct {
 	// onConnect is sent, in order, as soon as the connection is established.
 	onConnect []string
@@ -77,6 +78,11 @@ type epochScript struct {
 	// received some records and no terminator, which is the case that separates
 	// "recovery was interrupted" from "recovery never started".
 	closeAfterFrames int
+	// dropRaw, when true, tears the TCP connection down abruptly after onConnect
+	// with no WebSocket close frame (coder's CloseNow) — the abnormal-closure
+	// fault, distinct from closeAfter's clean close frame. The client sees a
+	// synthesized 1006 rather than a coded remote close.
+	dropRaw bool
 }
 
 // recordedFrame is one frame the client sent.
@@ -110,7 +116,7 @@ func (f *fakeWS) URL() string {
 // private CA — so the tests exercise the real configuration path.
 func (f *fakeWS) client() *http.Client { return f.server.Client() }
 
-// script installs per-epoch behaviour. The last entry repeats for every epoch
+// script installs per-epoch behavior. The last entry repeats for every epoch
 // beyond those given.
 func (f *fakeWS) script(scripts ...epochScript) {
 	f.mu.Lock()
@@ -182,9 +188,7 @@ func (f *fakeWS) handle(w http.ResponseWriter, r *http.Request) {
 	epoch := f.dials
 	status, body := f.upgradeStatus, f.upgradeBody
 	headers := make(map[string]string, len(f.upgradeHeaders))
-	for k, v := range f.upgradeHeaders {
-		headers[k] = v
-	}
+	maps.Copy(headers, f.upgradeHeaders)
 	stall := f.stallUpgrade
 	script := f.scriptForEpoch(epoch)
 	f.mu.Unlock()
@@ -194,7 +198,7 @@ func (f *fakeWS) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Hold the handshake open if the test asked for it, but abandon the wait if
-	// the client goes away first — otherwise a cancelled dial would leave this
+	// the client goes away first — otherwise a canceled dial would leave this
 	// handler parked and the leak checker would report it.
 	if stall != nil {
 		select {
@@ -217,7 +221,7 @@ func (f *fakeWS) handle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer conn.CloseNow() //nolint:errcheck // best-effort teardown of a test fixture
+	defer conn.CloseNow()
 
 	f.serve(r.Context(), conn, epoch, script)
 }
@@ -240,6 +244,12 @@ func (f *fakeWS) serve(ctx context.Context, conn *websocket.Conn, epoch int, scr
 		if err := conn.Write(ctx, websocket.MessageText, []byte(msg)); err != nil {
 			return
 		}
+	}
+
+	// An abrupt drop: tear the socket down with no close frame.
+	if script.dropRaw {
+		_ = conn.CloseNow()
+		return
 	}
 
 	// An immediate close: nothing to wait for, so drop the connection now.
@@ -331,7 +341,7 @@ func TestFakeWSAcceptsAndRecords(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	closeUpgradeBody(resp)
-	defer conn.CloseNow() //nolint:errcheck // best-effort teardown
+	defer conn.CloseNow()
 
 	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"subscribe","channels":["acme.trades"]}`)); err != nil {
 		t.Fatalf("write: %v", err)
@@ -353,7 +363,7 @@ func TestFakeWSAcceptsAndRecords(t *testing.T) {
 	}
 }
 
-// Per-epoch scripting is what makes reconnect behaviour testable: connect #1 and
+// Per-epoch scripting is what makes reconnect behavior testable: connect #1 and
 // connect #2 must be able to differ, and the last script must repeat so a test
 // need not enumerate epochs it does not care about.
 func TestFakeWSScriptsPerEpoch(t *testing.T) {
@@ -410,7 +420,7 @@ func TestFakeWSRejectsUpgrade(t *testing.T) {
 		t.Fatal("no HTTP response accompanied the rejected upgrade")
 	}
 	defer closeUpgradeBody(resp)
-	if resp.StatusCode != 429 {
+	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Errorf("status = %d, want 429", resp.StatusCode)
 	}
 	if got := resp.Header.Get("Retry-After"); got != "3" {
@@ -434,7 +444,7 @@ func TestFakeWSWithholdsUnscriptedReplies(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	closeUpgradeBody(resp)
-	defer conn.CloseNow() //nolint:errcheck // best-effort teardown
+	defer conn.CloseNow()
 
 	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"history"}`)); err != nil {
 		t.Fatalf("write: %v", err)
@@ -465,7 +475,7 @@ func TestFakeWSClosesWithScriptedCode(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	closeUpgradeBody(resp)
-	defer conn.CloseNow() //nolint:errcheck // best-effort teardown
+	defer conn.CloseNow()
 
 	_, _, err = conn.Read(ctx)
 	if err == nil {
@@ -503,7 +513,7 @@ func TestFakeWSClosesMidStream(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	closeUpgradeBody(resp)
-	defer conn.CloseNow() //nolint:errcheck // best-effort teardown
+	defer conn.CloseNow()
 
 	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"replay","from_pos":"kafka:7:40"}`)); err != nil {
 		t.Fatalf("write: %v", err)
