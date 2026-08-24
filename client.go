@@ -74,8 +74,12 @@ type Client struct {
 	// the close cause for diagnosis while Err() stays nil.
 	terminalCause error
 	conn          Conn
-	started       bool // the supervisor was launched (Connect called)
-	closed        bool // Close was called
+	// currentEpoch is the live epoch, so the auth-owner can record a
+	// connected-refresh TokenSource-exhaustion terminal into its first-cause slot
+	// (the owner cannot call terminalSequence itself). nil between epochs.
+	currentEpoch *epoch
+	started      bool // the supervisor was launched (Connect called)
+	closed       bool // Close was called
 }
 
 // NewClient builds a client for a URL. It validates the configuration and fails

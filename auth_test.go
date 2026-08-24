@@ -2,6 +2,7 @@ package sukko
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,15 +10,17 @@ import (
 )
 
 // authClient builds a fakeWS-pointed client with the given auth options (no
-// WithNoAuth), so the dial carries a real credential.
-func authClient(t *testing.T, f *fakeWS, opts ...Option) *Client {
+// WithNoAuth), so the dial carries a real credential. It returns the fake clock
+// so a test can advance past the RefreshMinInterval floor between auth sends.
+func authClient(t *testing.T, f *fakeWS, opts ...Option) (*Client, *fakeClock) {
 	t.Helper()
-	base := []Option{WithHTTPClient(f.client()), WithClock(newFakeClock())}
+	fc := newFakeClock()
+	base := []Option{WithHTTPClient(f.client()), WithClock(fc)}
 	c, err := NewClient(context.Background(), f.URL(), append(base, opts...)...)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	return c
+	return c, fc
 }
 
 // connectThenClose connects, waits for the handshake, and closes cleanly — enough
@@ -56,7 +59,7 @@ func TestDialAppliesCredential(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeWS(t)
 			f.script(epochScript{})
-			c := authClient(t, f, tc.opts...)
+			c, _ := authClient(t, f, tc.opts...)
 			connectThenClose(t, c)
 
 			got := f.authAt(1)
@@ -82,7 +85,7 @@ func TestDialAppliesCredential(t *testing.T) {
 func TestRefreshTokenSingleFlight(t *testing.T) {
 	f := newFakeWS(t)
 	f.script(epochScript{}) // no reply to `auth` → auth_ack withheld, the flight stays open
-	c := authClient(t, f, WithToken("jwt-1"))
+	c, _ := authClient(t, f, WithToken("jwt-1"))
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -111,7 +114,7 @@ func TestRefreshTokenSingleFlight(t *testing.T) {
 func TestRefreshTokenAckClearsInFlight(t *testing.T) {
 	f := newFakeWS(t)
 	f.script(epochScript{respond: map[string][]string{typeAuth: {`{"type":"auth_ack","data":{"exp":0}}`}}})
-	c := authClient(t, f, WithToken("jwt-1"))
+	c, fc := authClient(t, f, WithToken("jwt-1"))
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -124,10 +127,13 @@ func TestRefreshTokenAckClearsInFlight(t *testing.T) {
 
 	// A SINGLE second refresh must produce a second auth frame — deferred via the
 	// pending flag until the auth_ack clears the flight, never dropped. A retry
-	// loop here would mask the random-select coalescing bug (finding B).
+	// loop here would mask the random-select coalescing bug (finding B). It is also
+	// floored to RefreshMinInterval since the first auth, so advance past the floor.
 	if err := c.RefreshToken(context.Background()); err != nil {
 		t.Fatalf("RefreshToken #2: %v", err)
 	}
+	fc.BlockUntilTimer(purposeRefresh)
+	fc.Advance(DefaultRefreshMinInterval)
 	waitForFrameCount(t, f, typeAuth, 2)
 }
 
@@ -170,10 +176,14 @@ func TestRefreshTokenSurvivesReconnect(t *testing.T) {
 	waitForDialCount(t, f, 2)
 	waitForState(t, c, StateConnected)
 
-	// The wedge bug (inFlight stuck true) would make this a permanent no-op.
+	// The wedge bug (inFlight stuck true) would make this a permanent no-op. The
+	// send is floored to RefreshMinInterval since epoch 1's auth, so advance past
+	// the floor to see it go out on epoch 2.
 	if err := c.RefreshToken(context.Background()); err != nil {
 		t.Fatalf("RefreshToken after reconnect: %v", err)
 	}
+	fc.BlockUntilTimer(purposeRefresh)
+	fc.Advance(DefaultRefreshMinInterval)
 	waitForFrameCount(t, f, typeAuth, 2)
 	auths := f.framesOfType(typeAuth)
 	if last := auths[len(auths)-1]; last.epoch != 2 {
@@ -304,6 +314,190 @@ func TestRefreshWantedWhileDisconnectedSendsOnReconnect(t *testing.T) {
 	waitForFrameCount(t, f, typeAuth, 1)
 	if got := f.framesOfType(typeAuth)[0].epoch; got != 2 {
 		t.Errorf("auth frame on epoch %d, want 2 (retried on reconnect)", got)
+	}
+}
+
+// TestTokenSourceFetchThenSend covers the connected-refresh fetch: a TokenSource
+// client fetches a fresh credential and sends THAT (not the stored dial token) in
+// the auth frame.
+func TestTokenSourceFetchThenSend(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{})
+	ts := func(context.Context) (Token, error) { return Token{Value: "fetched-jwt"}, nil }
+	c, _ := authClient(t, f, WithToken("static-jwt"), WithTokenSource(ts))
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	waitForFrameCount(t, f, typeAuth, 1)
+	if raw := f.framesOfType(typeAuth)[0].raw; !strings.Contains(raw, "fetched-jwt") {
+		t.Errorf("auth frame = %s, want it to carry the fetched token", raw)
+	}
+	// The dial used the static token; the refresh used the fetched one.
+	if got := f.authAt(1).authorization; got != "Bearer static-jwt" {
+		t.Errorf("dial Authorization = %q, want the static token", got)
+	}
+}
+
+// TestTokenSourceFailureSurfacesAndRetries covers a single fetch failure: no auth
+// frame, an in-band *TokenSourceError{Attempt:1}, and a retry armed (not terminal).
+func TestTokenSourceFailureSurfacesAndRetries(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{})
+	ts := func(context.Context) (Token, error) { return Token{}, errors.New("token endpoint down") }
+	c, _ := authClient(t, f, WithToken("static-jwt"), WithTokenSource(ts), WithRand(newFakeRand()))
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	tse := waitForTokenSourceError(t, ec)
+	if tse.Attempt != 1 {
+		t.Errorf("Attempt = %d, want 1", tse.Attempt)
+	}
+	if got := len(f.framesOfType(typeAuth)); got != 0 {
+		t.Errorf("auth frames = %d, want 0 (the fetch failed)", got)
+	}
+	if err := c.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil (one failure is non-terminal)", err)
+	}
+}
+
+// TestTokenSourceExhaustionTerminates covers the connected-refresh 5-strike: after
+// MaxTokenSourceAttempts consecutive fetch failures the client terminates with
+// ErrTokenSourceFailed, having surfaced one *TokenSourceError per attempt.
+func TestTokenSourceExhaustionTerminates(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{})
+	ts := func(context.Context) (Token, error) { return Token{}, errors.New("token endpoint down") }
+	// Lengthen the heartbeat so the 30s retry-floor advances below don't trip the
+	// 30s heartbeat + pong timeout and force a reconnect mid-exhaustion.
+	c, fc := authClient(t, f, WithToken("static-jwt"), WithTokenSource(ts),
+		WithRand(newFakeRand()), WithHeartbeatInterval(time.Hour))
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// The RefreshToken fails once; drive the remaining retries to exhaustion.
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	for range MaxTokenSourceAttempts - 1 {
+		fc.BlockUntilTimer(purposeRefresh)
+		fc.Advance(DefaultRefreshMinInterval)
+	}
+
+	ec.waitClosed(t)
+	if err := c.Err(); !errors.Is(err, ErrTokenSourceFailed) {
+		t.Errorf("Err() = %v, want ErrTokenSourceFailed", err)
+	}
+	if got := c.State(); got != StateError {
+		t.Errorf("State() = %v, want error", got)
+	}
+	var term *Terminal
+	var tseCount int
+	for _, ev := range ec.snapshot() {
+		switch e := ev.(type) {
+		case *Terminal:
+			term = e
+		case *TokenSourceError:
+			tseCount++
+		}
+	}
+	if term == nil || !errors.Is(term.Err, ErrTokenSourceFailed) {
+		t.Errorf("Terminal.Err = %v, want ErrTokenSourceFailed", term)
+	}
+	if tseCount != MaxTokenSourceAttempts {
+		t.Errorf("*TokenSourceError count = %d, want %d", tseCount, MaxTokenSourceAttempts)
+	}
+}
+
+// TestTokenSourceNotFetchedWhileDisconnected pins finding 1: with no live socket
+// (during a reconnect backoff) the owner must NOT invoke TokenSource — a
+// disconnected fetch failure would burn a connected-path exhaustion strike during
+// a backoff FR-005 says is non-terminal.
+func TestTokenSourceNotFetchedWhileDisconnected(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{closeAfter: 1011}, epochScript{}) // epoch 1 drops immediately
+	fetched := make(chan struct{}, 4)
+	ts := func(context.Context) (Token, error) {
+		fetched <- struct{}{}
+		return Token{Value: "fetched"}, nil
+	}
+	c, _ := authClient(t, f, WithToken("static"), WithTokenSource(ts), WithRand(newFakeRand()))
+	ec := collectEvents(c)
+	_ = c.Connect(context.Background())
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+		ec.waitClosed(t)
+	}()
+
+	waitForState(t, c, StateReconnecting)
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	select {
+	case <-fetched:
+		t.Fatal("TokenSource invoked while disconnected")
+	case <-time.After(200 * time.Millisecond): // correct: no fetch without a live socket
+	}
+}
+
+// TestTokenSourcePanicContained pins finding 2: a panicking TokenSource is
+// contained (it does not crash the process) and counts as a failure — driven to
+// exhaustion it terminates with ErrTokenSourceFailed rather than silently killing
+// the refresh subsystem.
+func TestTokenSourcePanicContained(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{})
+	ts := func(context.Context) (Token, error) { panic("token source boom") }
+	c, fc := authClient(t, f, WithToken("static"), WithTokenSource(ts),
+		WithRand(newFakeRand()), WithHeartbeatInterval(time.Hour))
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	for range MaxTokenSourceAttempts - 1 {
+		fc.BlockUntilTimer(purposeRefresh)
+		fc.Advance(DefaultRefreshMinInterval)
+	}
+
+	ec.waitClosed(t)
+	if err := c.Err(); !errors.Is(err, ErrTokenSourceFailed) {
+		t.Errorf("Err() = %v, want ErrTokenSourceFailed (panic contained + counted)", err)
+	}
+}
+
+// waitForTokenSourceError polls the collected events for a *TokenSourceError.
+func waitForTokenSourceError(t *testing.T, ec *eventCollector) *TokenSourceError {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		for _, ev := range ec.snapshot() {
+			if e, ok := ev.(*TokenSourceError); ok {
+				return e
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatal("no *TokenSourceError surfaced")
+		case <-time.After(2 * time.Millisecond):
+		}
 	}
 }
 

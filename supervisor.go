@@ -170,8 +170,13 @@ func (c *Client) run(connectCtx context.Context) {
 		c.upAuthOwner()
 
 		out, rootStopped := c.runEpoch(conn)
-		// The epoch ended: tell the auth-owner to abandon any refresh that was
-		// outstanding on this now-dead connection (its answer will never arrive).
+		// The epoch ended. Clear the live-conn reference so the auth-owner's
+		// conn-nil guard actually holds between epochs — otherwise it would fetch a
+		// TokenSource and send on a dead socket while reconnecting, burning
+		// connected-path strikes during a backoff FR-005 says is non-terminal.
+		c.setConn(nil)
+		// Tell the auth-owner to abandon any refresh outstanding on this now-dead
+		// connection (its answer will never arrive).
 		c.resetAuthOwner()
 		// Discriminate on cause, not outcome (as the dial path does): if Close or a
 		// lifetime cancel raced the epoch's end — even if the heartbeat or a panic
@@ -198,7 +203,6 @@ func (c *Client) acquireConn(connectCtx context.Context, first bool) (Conn, erro
 	if first {
 		conn, err = c.dial(connectCtx)
 	} else {
-		//nolint:contextcheck // a reconnect dial is bounded by the stored client-lifetime context (rootCtx) plus the injectable dial timer, by design — there is no caller context to thread through, and using one would defeat the "a live reconnect is torn down only by the client lifetime" rule.
 		conn, err = c.reconnectDial()
 	}
 	// Redact at the single source: a network dial failure returns Go's *url.Error
@@ -231,29 +235,46 @@ func (c *Client) dial(connectCtx context.Context) (Conn, error) {
 // goroutine cancels the dial when the timer fires and exits when the dial
 // completes, so no goroutine outlives the call (goleak stays clean).
 func (c *Client) reconnectDial() (Conn, error) {
-	dialCtx, cancel := context.WithCancel(c.rootCtx)
+	var conn Conn
+	err := c.callWithTimeout(c.rootCtx, c.cfg.dialTimeout, purposeDial, func(ctx context.Context) error {
+		var e error
+		conn, e = c.transport.Open(ctx)
+		if e != nil {
+			return fmt.Errorf("sukko: reconnect dial: %w", e)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+// callWithTimeout runs fn under a context canceled by the injectable timer of the
+// given purpose (or by the parent). It is the shared shape for the two external
+// calls the SDK must bound through the clock seam rather than context.WithTimeout
+// (§VII forbids real time in tests): the reconnect dial and the TokenSource fetch.
+// A watcher goroutine cancels on the timer firing and exits when fn completes, so
+// no goroutine outlives the call (goleak stays clean).
+func (c *Client) callWithTimeout(parent context.Context, timeout time.Duration, purpose timerPurpose, fn func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	timer := c.clock.NewTimer(c.cfg.dialTimeout, purposeDial)
+	timer := c.clock.NewTimer(timeout, purpose)
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		// Trivial channel select — panic-free; the shared recover helper (T077)
-		// is installed at every goroutine entry in a later slice.
 		select {
 		case <-timer.C():
-			cancel() // dial timed out
-		case <-dialCtx.Done():
+			cancel() // timed out
+		case <-ctx.Done():
 			timer.Stop()
 		}
 	})
 
-	conn, err := c.transport.Open(dialCtx)
-	cancel()  // wake the watcher on a completed dial before it can fire the timer path
+	err := fn(ctx)
+	cancel()  // wake the watcher on a completed call before it can fire the timer
 	wg.Wait() // the watcher has exited before we return
-	if err != nil {
-		return nil, fmt.Errorf("sukko: reconnect dial: %w", err)
-	}
-	return conn, nil
+	return err
 }
 
 // backoffWait sleeps for delay on the injectable "backoff" timer, returning false
@@ -280,12 +301,14 @@ func (c *Client) backoffWait(delay time.Duration) bool {
 // outcome). Both goroutines are torn down before it returns.
 func (c *Client) runEpoch(conn Conn) (out terminationOutcome, rootStopped bool) {
 	e := newEpoch(c.rootCtx)
+	c.setCurrentEpoch(e) // let the auth-owner reach this epoch's first-cause slot
 	// Registered FIRST so it runs LAST (LIFO): after the decode-loop recover
 	// (below) has had its chance to record a panic, cancel the epoch, wait for the
 	// heartbeat goroutine to exit, then read the recorded termination. A decode
 	// loop panic unwinds (it produces no read error), so reading the slot here —
 	// not off a return value — is what carries a panic outcome out.
 	defer func() {
+		c.clearCurrentEpoch(e)
 		e.cancel()
 		e.wg.Wait()
 		// Close the epoch's conn unconditionally (best-effort, idempotent via
@@ -572,6 +595,28 @@ func (c *Client) currentConn() Conn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn
+}
+
+func (c *Client) setCurrentEpoch(e *epoch) {
+	c.mu.Lock()
+	c.currentEpoch = e
+	c.mu.Unlock()
+}
+
+// clearCurrentEpoch nils the reference only if it is still e — a fast reconnect
+// may have already installed the next epoch.
+func (c *Client) clearCurrentEpoch(e *epoch) {
+	c.mu.Lock()
+	if c.currentEpoch == e {
+		c.currentEpoch = nil
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) currentEpochRef() *epoch {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.currentEpoch
 }
 
 func (c *Client) setErr(err error) {

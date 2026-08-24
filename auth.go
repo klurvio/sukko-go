@@ -3,6 +3,7 @@ package sukko
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"sync"
@@ -117,6 +118,8 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		lastAuthSent      time.Time // for the RefreshMinInterval floor
 		refreshTimer      Timer     // the proactive/reactive refresh schedule; nil = disarmed
 		refreshC          <-chan time.Time
+		tokenFailCount    int       // consecutive TokenSource fetch failures; reset on any success
+		lastFetchAt       time.Time // last TokenSource fetch attempt, for fetch pacing
 	)
 
 	disarmRefresh := func() {
@@ -135,21 +138,71 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		if inFlight || !pending {
 			return
 		}
-		if c.sendAuthRefresh(ownerCtx) {
+		conn := c.currentConn()
+		if conn == nil {
+			return // no live socket; the epoch-up signal retries on the reconnect
+		}
+		// Honor the RefreshMinInterval floor at SEND time, not only at arm time: a
+		// proactive timer that fired mid-flight, or a caller RefreshToken, must not
+		// bypass the server's 1-per-interval rate limit. The first auth (zero
+		// lastAuthSent) is not floored.
+		if !lastAuthSent.IsZero() {
+			if wait := lastAuthSent.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()); wait > 0 {
+				armRefresh(wait)
+				return
+			}
+		}
+
+		// Obtain the credential to present. A TokenSource client fetches a fresh
+		// one (owner-only invocation, bounded by the token_source timer); a static
+		// client reads the stored token.
+		var token string
+		if c.cfg.tokenSource != nil {
+			// Pace fetches on the last fetch attempt, not the last successful send:
+			// while fetches fail no auth is sent, so lastAuthSent never advances, and
+			// a RefreshToken burst — the natural reaction to *TokenSourceError — would
+			// hammer the token endpoint straight to the exhaustion terminal.
+			if !lastFetchAt.IsZero() {
+				if wait := lastFetchAt.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()); wait > 0 {
+					armRefresh(wait)
+					return
+				}
+			}
+			lastFetchAt = c.clock.Now()
+			tok, err := c.fetchToken(ownerCtx)
+			if err != nil {
+				if ownerCtx.Err() != nil {
+					return // a fetch aborted by owner shutdown is not a credential failure
+				}
+				tokenFailCount++
+				attempt := tokenFailCount
+				// Record the connected-refresh terminal BEFORE emitting the attempt
+				// error, so a parked emit cannot delay it (the epoch record cancels
+				// the epoch, which drives teardown and unparks the emit). Between
+				// epochs the record no-ops; the retry armed below re-terminates once
+				// connected, so the owner can never wedge at Max with no timer.
+				if attempt >= MaxTokenSourceAttempts {
+					c.terminateTokenSourceExhausted()
+				}
+				c.ownerSurface(ownerCtx, &TokenSourceError{Attempt: attempt, Cause: err})
+				armRefresh(max(computeBackoffDelay(c.cfg.backoff, attempt-1, c.cfg.rand), c.cfg.refreshMinInterval))
+				return
+			}
+			tokenFailCount = 0
+			c.creds.setToken(tok.Value)
+			token = tok.Value
+		} else {
+			token, _ = c.creds.snapshot()
+			if token == "" {
+				return // API-key-only: nothing to refresh with
+			}
+		}
+
+		if c.sendAuthFrame(ownerCtx, conn, token) {
 			inFlight = true
 			pending = false
 			lastAuthSent = c.clock.Now()
 		}
-		// A no-op send (no live socket) leaves pending set; the epoch-up signal
-		// retries it on the new connection.
-		//
-		// The RefreshMinInterval floor is enforced at ARM time (armProactive /
-		// armReactive), so the automatic schedule respects it. A narrow bypass
-		// remains: a proactive timer that fires mid-flight sets pending, and this
-		// send runs when the flight completes without re-checking the floor — a
-		// too-soon send the server rate-limits (answered with auth_error →
-		// reactive re-refresh, self-limiting). A floor-at-send check lands with the
-		// TokenSource increment, where the send path is reworked anyway.
 	}
 	// armProactive arms the next refresh from the known expiry, floored so it never
 	// schedules within RefreshMinInterval of the last auth. exp == 0 (never
@@ -205,6 +258,7 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			// unchanged by a reconnect), so the timer is left running.
 			inFlight = false
 			c.authInbox.drain()
+			advance() // a still-wanted refresh: no-ops now (conn cleared), retried on epoch-up
 		case <-c.authEpochUp:
 			// A new epoch is connected: retry a refresh wanted while disconnected
 			// (e.g. the proactive timer fired during backoff and could not send).
@@ -217,27 +271,104 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 	}
 }
 
-// sendAuthRefresh sends an `auth` frame carrying the current JWT on the live
-// connection, reporting whether it was sent. It is a no-op (false) when there is
-// no JWT to refresh with or no live socket — a reconnect re-authenticates via the
-// dial credential, so a refresh while disconnected is moot.
-func (c *Client) sendAuthRefresh(ownerCtx context.Context) bool {
-	token, _ := c.creds.snapshot()
-	if token == "" {
-		return false
-	}
-	conn := c.currentConn()
-	if conn == nil {
-		return false
-	}
+// sendAuthFrame marshals and sends an `auth` frame carrying token on conn,
+// reporting whether it was sent. A send error means the socket is going away; the
+// read side classifies it.
+func (c *Client) sendAuthFrame(ownerCtx context.Context, conn Conn, token string) bool {
 	frame, err := json.Marshal(wireAuth{Type: typeAuth, Data: authPayload{Token: token}})
 	if err != nil {
 		return false // unreachable: a struct of strings always marshals
 	}
-	if err := conn.Send(ownerCtx, frame); err != nil {
-		return false // the socket is going away; the read side classifies it
+	return conn.Send(ownerCtx, frame) == nil
+}
+
+// tokenResult carries a TokenSource outcome from its detached goroutine.
+type tokenResult struct {
+	tok Token
+	err error
+}
+
+// fetchToken invokes the caller's TokenSource, bounded by the injectable
+// token_source timer. The callback runs in its OWN goroutine, not inline, for two
+// reasons: a callback that ignores its context or blocks cannot hang the owner
+// (and thus Close/terminal, which wait on the owner to exit), and a panicking
+// callback is contained here rather than crashing the caller's process (§VI). On a
+// timeout or owner cancellation the goroutine is abandoned — it exits when the
+// callback finally returns, sending into a buffered channel that never blocks. The
+// detached goroutine cannot be a tracked wg.Go (a blocking Wait would defeat the
+// abandon), and its inline recover is the required §VI containment for the
+// untrusted caller code it runs.
+func (c *Client) fetchToken(ownerCtx context.Context) (Token, error) {
+	fetchCtx, cancel := context.WithCancel(ownerCtx)
+	defer cancel()
+
+	timer := c.clock.NewTimer(c.cfg.tokenSourceTimeout, purposeTokenSource)
+	defer timer.Stop()
+
+	res := make(chan tokenResult, 1) // buffered: an abandoned goroutine never blocks
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				res <- tokenResult{err: fmt.Errorf("sukko: token source panicked: %v", r)}
+			}
+		}()
+		tok, err := c.cfg.tokenSource(fetchCtx)
+		res <- tokenResult{tok: tok, err: err}
+	}()
+
+	select {
+	case r := <-res:
+		if r.err != nil {
+			return Token{}, fmt.Errorf("sukko: token source: %w", r.err)
+		}
+		if r.tok.Value == "" {
+			return Token{}, errEmptyTokenSource
+		}
+		return r.tok, nil
+	case <-timer.C():
+		return Token{}, errTokenSourceTimeout // abandon the goroutine (defer cancels its ctx)
+	case <-ownerCtx.Done():
+		return Token{}, fmt.Errorf("sukko: token source: %w", ownerCtx.Err())
 	}
-	return true
+}
+
+var (
+	// errEmptyTokenSource is returned when a TokenSource yields an empty
+	// credential — a failure like any other, retried and counted toward exhaustion.
+	errEmptyTokenSource = errors.New("sukko: token source returned an empty token")
+	// errTokenSourceTimeout is the bound WithTokenSourceTimeout enforces on a
+	// single fetch.
+	errTokenSourceTimeout = errors.New("sukko: token source timed out")
+)
+
+// ownerSurface emits an auth-owner event on the delivery channel using the OWNER
+// context (not root) for the epoch slot: an owner parked here on a full channel
+// must unpark when the owner is torn down (ownerCancel), or ownerWg.Wait() — and
+// thus Close/terminal — would hang. *TokenSourceError is the may-block region.
+func (c *Client) ownerSurface(ownerCtx context.Context, ev Event) {
+	c.delivery.send(c.rootCtx, ownerCtx, ev)
+}
+
+// terminateTokenSourceExhausted records the connected-refresh TokenSource
+// exhaustion terminal into the current epoch's first-cause slot and cancels it —
+// the same mechanism the heartbeat timeout uses. The owner cannot call
+// terminalSequence or cancel root itself. Between epochs the reference is nil and
+// this no-ops; the reconnect path's fetch failures then carry the client
+// (non-terminal), which is spec-coherent (FR-005).
+func (c *Client) terminateTokenSourceExhausted() {
+	ep := c.currentEpochRef()
+	if ep == nil {
+		return
+	}
+	out, ok := lookupInternalCausePolicy(causeTokenSourceExhausted, c.cfg.reconnect)
+	if !ok {
+		return
+	}
+	ep.record(terminationOutcome{
+		class:   out.class,
+		cause:   ErrTokenSourceFailed,
+		trigger: triggerForClass(out.class),
+	})
 }
 
 // pokeAuthOwner signals the auth-owner that a refresh answer arrived. Non-blocking
