@@ -2,6 +2,7 @@ package sukko
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -177,6 +178,132 @@ func TestRefreshTokenSurvivesReconnect(t *testing.T) {
 	auths := f.framesOfType(typeAuth)
 	if last := auths[len(auths)-1]; last.epoch != 2 {
 		t.Errorf("second auth frame on epoch %d, want 2 (post-reconnect)", last.epoch)
+	}
+}
+
+// TestRefreshArmsProactivelyFromAckExp covers proactive arming: an auth_ack's
+// expiry schedules the next refresh at exp − RefreshLead, so the SDK rotates the
+// credential automatically before it expires. It also pins the *Authenticated
+// surfaced for a successful refresh.
+func TestRefreshArmsProactivelyFromAckExp(t *testing.T) {
+	fc := newFakeClock()
+	now := fc.Now()
+	exp := now.Add(time.Hour).Unix() // the credential expires in one hour
+	ackFrame := fmt.Sprintf(`{"type":"auth_ack","data":{"exp":%d}}`, exp)
+
+	f := newFakeWS(t)
+	f.script(epochScript{respond: map[string][]string{typeAuth: {ackFrame}}})
+	c, err := NewClient(context.Background(), f.URL(),
+		WithHTTPClient(f.client()), WithClock(fc), WithRand(newFakeRand()), WithToken("jwt-1"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	// One refresh gets an auth_ack{exp}; the owner arms the proactive timer.
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	waitForFrameCount(t, f, typeAuth, 1)
+
+	// Advance to exp − RefreshLead (floored). The proactive timer fires and the
+	// SDK refreshes on its own — a second auth frame with no caller call.
+	fc.BlockUntilTimer(purposeRefresh)
+	refreshAt := time.Unix(exp, 0).Add(-DefaultRefreshLead)
+	if floor := now.Add(DefaultRefreshMinInterval); refreshAt.Before(floor) {
+		refreshAt = floor
+	}
+	fc.Advance(refreshAt.Sub(now))
+	waitForFrameCount(t, f, typeAuth, 2)
+
+	var authed int
+	for _, ev := range ec.snapshot() {
+		if a, ok := ev.(*Authenticated); ok && a.Mode == AuthRefresh {
+			authed++
+		}
+	}
+	if authed < 1 {
+		t.Errorf("*Authenticated count = %d, want ≥1 for the successful refresh", authed)
+	}
+}
+
+// TestRefreshArmsReactivelyFromAuthError covers the reactive path: an auth_error
+// schedules a refresh (floored by RefreshMinInterval so an auth_error→refresh
+// storm is impossible), and *AuthError is surfaced in-band.
+func TestRefreshArmsReactivelyFromAuthError(t *testing.T) {
+	fc := newFakeClock()
+	f := newFakeWS(t)
+	f.script(epochScript{onConnect: []string{`{"type":"auth_error","data":{"code":"token_expired","message":"expired"}}`}})
+	c, err := NewClient(context.Background(), f.URL(),
+		WithHTTPClient(f.client()), WithClock(fc), WithRand(newFakeRand()), WithToken("jwt-1"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	// The auth_error arms a reactive refresh; fire it and confirm an auth frame.
+	fc.BlockUntilTimer(purposeRefresh)
+	fc.Advance(time.Second)
+	waitForFrameCount(t, f, typeAuth, 1)
+
+	var sawErr bool
+	for _, ev := range ec.snapshot() {
+		if _, ok := ev.(*AuthError); ok {
+			sawErr = true
+		}
+	}
+	if !sawErr {
+		t.Error("no *AuthError surfaced for the auth_error frame")
+	}
+}
+
+// TestRefreshWantedWhileDisconnectedSendsOnReconnect pins finding 1's fix: a
+// refresh wanted while there is no live socket (here a RefreshToken during
+// backoff; in production a proactive timer firing in the reconnect gap) is not
+// lost — the epoch-up signal retries it once the new connection is up.
+func TestRefreshWantedWhileDisconnectedSendsOnReconnect(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(
+		epochScript{closeAfter: 1011}, // epoch 1 closes immediately (reconnect-class)
+		epochScript{},                 // epoch 2 is healthy
+	)
+	fc := newFakeClock()
+	c, err := NewClient(context.Background(), f.URL(),
+		WithHTTPClient(f.client()), WithClock(fc), WithRand(newFakeRand()), WithToken("jwt-1"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ec := collectEvents(c)
+	_ = c.Connect(context.Background())
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+		ec.waitClosed(t)
+	}()
+
+	// Epoch 1 dropped; the client is reconnecting. A refresh now cannot send
+	// (no live socket) and must be remembered, not dropped.
+	waitForState(t, c, StateReconnecting)
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+
+	// Reconnect: the epoch-up signal retries the wanted refresh on epoch 2.
+	fc.BlockUntilTimer(purposeBackoff)
+	fc.Advance(DefaultBackoff.Initial)
+	waitForDialCount(t, f, 2)
+	waitForFrameCount(t, f, typeAuth, 1)
+	if got := f.framesOfType(typeAuth)[0].epoch; got != 2 {
+		t.Errorf("auth frame on epoch %d, want 2 (retried on reconnect)", got)
 	}
 }
 

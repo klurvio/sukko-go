@@ -165,6 +165,9 @@ func (c *Client) run(connectCtx context.Context) {
 		attempt = 0
 		override = nil
 		c.transition(triggerHandshakeOK) // connecting/reconnecting → connected
+		// The connection is live: let the auth-owner retry a refresh it wanted
+		// while disconnected (a proactive timer that fired during backoff).
+		c.upAuthOwner()
 
 		out, rootStopped := c.runEpoch(conn)
 		// The epoch ended: tell the auth-owner to abandon any refresh that was
@@ -464,16 +467,19 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		return
 	}
 
-	// auth_ack and auth_error answer an in-flight refresh: poke the auth-owner so
-	// it clears its single-flight marker. auth_ack is otherwise silent here (its
-	// exp/mode side effects and the *Authenticated emission land with the
-	// refresh-arming logic); auth_error still flows to surfaceEvent below, so its
-	// *AuthError is forwarded in receive order.
-	switch decoded.(type) {
+	// auth_ack and auth_error answer an in-flight refresh: record the answer in the
+	// inbox and poke the auth-owner (it clears its flight and re-arms the refresh
+	// schedule). auth_ack also surfaces *Authenticated in receive order — every
+	// auth is a refresh today; the mode becomes owner state once Escalate lands.
+	// auth_error falls through to surfaceEvent below, forwarding *AuthError.
+	switch f := decoded.(type) {
 	case *wireAuthAck:
+		c.authInbox.putAck(f.Data.Exp)
 		c.pokeAuthOwner()
+		c.forward(e.ctx, &Authenticated{Exp: f.Data.Exp, Mode: AuthRefresh})
 		return
 	case *wireAuthError:
+		c.authInbox.putError()
 		c.pokeAuthOwner()
 	}
 

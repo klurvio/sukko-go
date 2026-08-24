@@ -27,6 +27,9 @@ type Client struct {
 	// redactor masks credentials in returned errors (a dial *url.Error embeds the
 	// query-param token) and in log records.
 	redactor *redactor
+	// authInbox carries auth_ack/auth_error answers from the decode loop to the
+	// auth-owner (coalesced; drained on each poke).
+	authInbox *authInbox
 
 	// rootCtx is the client-lifetime context: canceling it tears the client
 	// down exactly as Close does. rootCancel is that cancel.
@@ -49,6 +52,11 @@ type Client struct {
 	// come on the new connection, and the reconnect re-auths via the dial
 	// credential. Buffered(1), sent non-blocking by the supervisor per epoch.
 	authEpochReset chan struct{}
+	// authEpochUp tells the auth-owner a new epoch is connected, so it retries a
+	// refresh that was wanted while disconnected (e.g. the proactive timer fired
+	// during backoff and could not send). Buffered(1), sent non-blocking by the
+	// supervisor after each handshake.
+	authEpochUp chan struct{}
 	// doneCh is closed by terminalSequence when teardown is complete.
 	doneCh chan struct{}
 	// terminalOnce guards the whole terminal sequence: it runs once whether the
@@ -110,12 +118,14 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 		counters:       counters,
 		creds:          creds,
 		redactor:       redactor,
+		authInbox:      &authInbox{},
 		rootCtx:        rootCtx,
 		rootCancel:     rootCancel,
 		firstDial:      make(chan error, 1),
 		authRefreshCmd: make(chan struct{}, 1),
 		authPoke:       make(chan struct{}, 1),
 		authEpochReset: make(chan struct{}, 1),
+		authEpochUp:    make(chan struct{}, 1),
 		doneCh:         make(chan struct{}),
 		state:          StateDisconnected,
 	}

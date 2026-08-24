@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"sync"
+	"time"
 )
 
 // Dial-time credential material. The names match the contract's auth bindings and
@@ -19,6 +20,42 @@ const (
 	queryParamToken  = "token"
 	queryParamAPIKey = "api_key"
 )
+
+// authInbox coalesces the answers the decode loop hands the auth-owner: the
+// latest auth_ack expiry and whether an auth_error arrived. The owner drains it
+// on each poke. Coalescing (not a queue) is deliberate — the owner needs the
+// latest state, and the buffered-1 poke must never drop the answer that both
+// completes a flight and re-arms the schedule.
+type authInbox struct {
+	mu       sync.Mutex
+	hasAck   bool
+	ackExp   int64
+	hasError bool
+}
+
+// putAck records an auth_ack's expiry (unix seconds; 0 = never expires).
+func (b *authInbox) putAck(exp int64) {
+	b.mu.Lock()
+	b.hasAck = true
+	b.ackExp = exp
+	b.mu.Unlock()
+}
+
+// putError records that an auth_error arrived.
+func (b *authInbox) putError() {
+	b.mu.Lock()
+	b.hasError = true
+	b.mu.Unlock()
+}
+
+// drain returns and clears the coalesced state.
+func (b *authInbox) drain() (hasAck bool, ackExp int64, hasError bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	hasAck, ackExp, hasError = b.hasAck, b.ackExp, b.hasError
+	b.hasAck, b.hasError = false, false
+	return hasAck, ackExp, hasError
+}
 
 // credentialStore holds the live credential — the JWT and/or API key — behind a
 // mutex so the dial path reads the current value (picking up rotation from
@@ -74,7 +111,26 @@ func (s *credentialStore) setToken(token string) {
 func (c *Client) runAuthOwner(ownerCtx context.Context) {
 	defer c.recoverAuthOwner()
 
-	var inFlight, pending bool
+	var (
+		inFlight, pending bool
+		exp               int64     // last known credential expiry (unix seconds; 0 = never)
+		lastAuthSent      time.Time // for the RefreshMinInterval floor
+		refreshTimer      Timer     // the proactive/reactive refresh schedule; nil = disarmed
+		refreshC          <-chan time.Time
+	)
+
+	disarmRefresh := func() {
+		if refreshTimer != nil {
+			refreshTimer.Stop()
+			refreshTimer = nil
+			refreshC = nil
+		}
+	}
+	armRefresh := func(after time.Duration) {
+		disarmRefresh()
+		refreshTimer = c.clock.NewTimer(max(after, 0), purposeRefresh)
+		refreshC = refreshTimer.C()
+	}
 	advance := func() {
 		if inFlight || !pending {
 			return
@@ -82,29 +138,80 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		if c.sendAuthRefresh(ownerCtx) {
 			inFlight = true
 			pending = false
+			lastAuthSent = c.clock.Now()
 		}
-		// A no-op send (no live socket) leaves pending set; the next epoch-reset
-		// clears it (the reconnect re-auths via the dial), and a later command
-		// retries — a refresh while disconnected is moot.
+		// A no-op send (no live socket) leaves pending set; the epoch-up signal
+		// retries it on the new connection.
+		//
+		// The RefreshMinInterval floor is enforced at ARM time (armProactive /
+		// armReactive), so the automatic schedule respects it. A narrow bypass
+		// remains: a proactive timer that fires mid-flight sets pending, and this
+		// send runs when the flight completes without re-checking the floor — a
+		// too-soon send the server rate-limits (answered with auth_error →
+		// reactive re-refresh, self-limiting). A floor-at-send check lands with the
+		// TokenSource increment, where the send path is reworked anyway.
+	}
+	// armProactive arms the next refresh from the known expiry, floored so it never
+	// schedules within RefreshMinInterval of the last auth. exp == 0 (never
+	// expires) disarms — nothing to refresh ahead of.
+	armProactive := func() {
+		if exp == 0 {
+			disarmRefresh()
+			return
+		}
+		refreshAt := time.Unix(exp, 0).Add(-c.cfg.refreshLead)
+		if floor := lastAuthSent.Add(c.cfg.refreshMinInterval); refreshAt.Before(floor) {
+			refreshAt = floor
+		}
+		armRefresh(refreshAt.Sub(c.clock.Now()))
+	}
+	// armReactive schedules a refresh after an auth_error, floored so an
+	// auth_error → refresh storm is impossible.
+	armReactive := func() {
+		armRefresh(lastAuthSent.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()))
 	}
 
 	for {
 		select {
 		case <-ownerCtx.Done():
+			disarmRefresh()
 			return
 		case <-c.authRefreshCmd:
 			pending = true
 			advance()
 		case <-c.authPoke:
-			// The in-flight refresh was answered; send a deferred one if pending.
-			inFlight = false
+			hasAck, ackExp, hasError := c.authInbox.drain()
+			// Clear the flight ONLY on a real answer: a spurious poke (the inbox
+			// already drained by a prior poke, or by an epoch reset) must not clear
+			// a live flight and let a second auth go out.
+			if hasAck || hasError {
+				inFlight = false
+			}
+			if hasAck {
+				exp = ackExp
+				armProactive()
+			}
+			if hasError {
+				armReactive()
+			}
 			advance()
 		case <-c.authEpochReset:
 			// The epoch ended before an answer arrived: abandon the outstanding
 			// flight — its answer will never come on the new connection. A refresh
-			// still WANTED (pending) survives and is retried; clearing it here would
-			// race a post-reconnect RefreshToken and drop it.
+			// still WANTED (pending) survives and is retried on the reconnect;
+			// clearing it here would race a post-reconnect RefreshToken and drop it.
+			// Drain the inbox so a stale answer from the dead epoch cannot later
+			// clear a fresh flight. The refresh SCHEDULE persists (the expiry is
+			// unchanged by a reconnect), so the timer is left running.
 			inFlight = false
+			c.authInbox.drain()
+		case <-c.authEpochUp:
+			// A new epoch is connected: retry a refresh wanted while disconnected
+			// (e.g. the proactive timer fired during backoff and could not send).
+			advance()
+		case <-refreshC:
+			// The proactive/reactive schedule fired: time to refresh.
+			pending = true
 			advance()
 		}
 	}
@@ -147,6 +254,15 @@ func (c *Client) pokeAuthOwner() {
 func (c *Client) resetAuthOwner() {
 	select {
 	case c.authEpochReset <- struct{}{}:
+	default:
+	}
+}
+
+// upAuthOwner tells the auth-owner a new epoch is connected, so it retries a
+// refresh wanted while disconnected. Non-blocking (buffered 1).
+func (c *Client) upAuthOwner() {
+	select {
+	case c.authEpochUp <- struct{}{}:
 	default:
 	}
 }
