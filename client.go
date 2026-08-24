@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"log/slog"
 	"sync"
 )
 
@@ -20,6 +21,12 @@ type Client struct {
 	transport Transport
 	delivery  *delivery
 	counters  *counters
+	// creds holds the live credential the dial presents. UpdateToken/Escalate
+	// mutate it; the transport reads it per dial so rotation is picked up.
+	creds *credentialStore
+	// redactor masks credentials in returned errors (a dial *url.Error embeds the
+	// query-param token) and in log records.
+	redactor *redactor
 
 	// rootCtx is the client-lifetime context: canceling it tears the client
 	// down exactly as Close does. rootCancel is that cancel.
@@ -65,13 +72,32 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 
 	rootCtx, rootCancel := context.WithCancel(ctx)
 	counters := &counters{}
+	creds := newCredentialStore(cfg.token, cfg.apiKey)
+
+	// Redact credentials at both §IX boundaries: returned errors and log records.
+	// A network dial failure returns Go's *url.Error, which embeds the full dial
+	// URL — including a query-param token — so a client using WithQueryParamAuth
+	// would otherwise leak its token through any transport error. Value masking
+	// covers the credential the client holds now; the redactor's pattern rules
+	// cover a rotated token (in a token=/Authorization/X-API-Key position) too.
+	redactor := newRedactor(cfg.token, cfg.apiKey)
+	cfg.logger = slog.New(redactor.wrapHandler(cfg.logger.Handler()))
+
+	// Under WithNoAuth the dial carries no credential; otherwise it reads the
+	// live store per connect.
+	var credentials func() (string, string)
+	if !cfg.noAuth {
+		credentials = creds.snapshot
+	}
 
 	c := &Client{
 		cfg:        cfg,
 		clock:      cfg.clock,
-		transport:  newWSTransport(url, cfg),
+		transport:  newWSTransport(url, cfg, credentials),
 		delivery:   newDelivery(cfg.queueSize, cfg.clock, counters),
 		counters:   counters,
+		creds:      creds,
+		redactor:   redactor,
 		rootCtx:    rootCtx,
 		rootCancel: rootCancel,
 		firstDial:  make(chan error, 1),
@@ -234,6 +260,18 @@ func (c *Client) Iter(ctx context.Context) iter.Seq[Event] {
 			}
 		}
 	}
+}
+
+// UpdateToken stores a JWT for the next connect and the next auth refresh. It is
+// store-only — it never sends an auth frame, in any state (that is RefreshToken
+// and Escalate) — and storing a JWT flips an API-key-only client's credential
+// class to publish-capable. An empty token is rejected.
+func (c *Client) UpdateToken(token string) error {
+	if token == "" {
+		return ErrEmptyToken
+	}
+	c.creds.setToken(token)
+	return nil
 }
 
 // Stats returns an eventually-consistent snapshot of the client's counters.

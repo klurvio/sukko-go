@@ -22,7 +22,7 @@ func wsTransportFor(t *testing.T, f *fakeWS) *wsTransport {
 	t.Helper()
 	cfg := defaultConfig()
 	cfg.httpClient = f.client()
-	return newWSTransport(f.URL(), cfg)
+	return newWSTransport(f.URL(), cfg, nil)
 }
 
 func TestWSTransportDialsAndReads(t *testing.T) {
@@ -208,7 +208,7 @@ func TestWSTransportReadLimitDerivedFromMaxPublishSize(t *testing.T) {
 		cfg := defaultConfig()
 		cfg.httpClient = f.client()
 		cfg.maxPublishSize = payloadSize // read limit = this + envelope overhead
-		tr := newWSTransport(f.URL(), cfg)
+		tr := newWSTransport(f.URL(), cfg, nil)
 
 		conn, err := tr.Open(context.Background())
 		if err != nil {
@@ -233,7 +233,7 @@ func TestWSTransportReadLimitDerivedFromMaxPublishSize(t *testing.T) {
 		cfg.httpClient = f.client()
 		// A tiny payload limit means the big frame exceeds the read limit.
 		cfg.maxPublishSize = 1024
-		tr := newWSTransport(f.URL(), cfg)
+		tr := newWSTransport(f.URL(), cfg, nil)
 
 		conn, err := tr.Open(context.Background())
 		if err != nil {

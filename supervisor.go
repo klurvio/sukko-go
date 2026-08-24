@@ -171,11 +171,20 @@ func (c *Client) run(connectCtx context.Context) {
 // acquireConn performs a dial: the first one bounded by the caller's connect
 // deadline, every reconnect bounded by the injectable "dial" timer.
 func (c *Client) acquireConn(connectCtx context.Context, first bool) (Conn, error) {
+	var conn Conn
+	var err error
 	if first {
-		return c.dial(connectCtx)
+		conn, err = c.dial(connectCtx)
+	} else {
+		//nolint:contextcheck // a reconnect dial is bounded by the stored client-lifetime context (rootCtx) plus the injectable dial timer, by design — there is no caller context to thread through, and using one would defeat the "a live reconnect is torn down only by the client lifetime" rule.
+		conn, err = c.reconnectDial()
 	}
-	//nolint:contextcheck // a reconnect dial is bounded by the stored client-lifetime context (rootCtx) plus the injectable dial timer, by design — there is no caller context to thread through, and using one would defeat the "a live reconnect is torn down only by the client lifetime" rule.
-	return c.reconnectDial()
+	// Redact at the single source: a network dial failure returns Go's *url.Error
+	// with the dial URL (query-param token included), and this error flows to both
+	// Connect (via firstDial) and Err() (via setErr). redactError is nil-safe and
+	// leaves a non-credential error (e.g. *HandshakeError) untouched so errors.As
+	// still matches.
+	return conn, c.redactor.redactError(err)
 }
 
 // dial performs the first dial, bounded by the connect deadline AND the client

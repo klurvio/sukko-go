@@ -58,6 +58,17 @@ type fakeWS struct {
 	// it — so a test can let the first dial succeed and hang only the reconnect
 	// dial, the shape the "dial" timer bounds.
 	stallFromEpoch int
+	// authRequests records the credential each upgrade attempt presented, so an
+	// auth test can assert the header/query the SDK sent at dial.
+	authRequests []capturedAuth
+}
+
+// capturedAuth is the credential material one upgrade request carried.
+type capturedAuth struct {
+	authorization string // the Authorization header value, e.g. "Bearer <jwt>"
+	apiKeyHeader  string // the X-API-Key header value
+	tokenQuery    string // the ?token= query value
+	apiKeyQuery   string // the ?api_key= query value
 }
 
 // epochScript describes one connection's behavior.
@@ -171,6 +182,16 @@ func (f *fakeWS) stallFrom(epoch int) (release func()) {
 	return func() { once.Do(func() { close(ch) }) }
 }
 
+// authAt returns the credential the given 1-based dial presented.
+func (f *fakeWS) authAt(dial int) capturedAuth {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if dial < 1 || dial > len(f.authRequests) {
+		return capturedAuth{}
+	}
+	return f.authRequests[dial-1]
+}
+
 // dialCount reports how many upgrades have been attempted. Reconnect
 // assertions are counts: "exactly one dial" is the positive form of "it did not
 // retry".
@@ -204,6 +225,13 @@ func (f *fakeWS) handle(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.dials++
 	epoch := f.dials
+	q := r.URL.Query()
+	f.authRequests = append(f.authRequests, capturedAuth{
+		authorization: r.Header.Get("Authorization"),
+		apiKeyHeader:  r.Header.Get("X-API-Key"),
+		tokenQuery:    q.Get("token"),
+		apiKeyQuery:   q.Get("api_key"),
+	})
 	status, body := f.upgradeStatus, f.upgradeBody
 	headers := make(map[string]string, len(f.upgradeHeaders))
 	maps.Copy(headers, f.upgradeHeaders)

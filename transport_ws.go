@@ -30,28 +30,69 @@ type wsTransport struct {
 	httpClient *http.Client
 	readLimit  int64
 	clock      Clock // for Retry-After HTTP-date parsing; §VII forbids time.Now
+	// credentials returns the current credential pair, read per dial so a rotation
+	// (UpdateToken/Escalate) or a fresh TokenSource value is picked up on the next
+	// connect. nil under WithNoAuth.
+	credentials    func() (token, apiKey string)
+	queryParamAuth bool
 }
 
 // newWSTransport builds a WebSocket transport for a URL. The read limit is
 // derived from MaxPublishSize plus envelope overhead, never left at
 // coder/websocket's 32 KiB default — otherwise a 64 KiB inbound message would
-// close the connection instead of being delivered.
-func newWSTransport(url string, cfg *config) *wsTransport {
+// close the connection instead of being delivered. credentials is read at every
+// dial; it is nil when the deployment is auth-disabled (WithNoAuth).
+func newWSTransport(url string, cfg *config, credentials func() (token, apiKey string)) *wsTransport {
 	return &wsTransport{
-		url:        url,
-		httpClient: cfg.httpClient,
-		readLimit:  int64(cfg.maxPublishSize) + wsEnvelopeOverhead,
-		clock:      cfg.clock,
+		url:            url,
+		httpClient:     cfg.httpClient,
+		readLimit:      int64(cfg.maxPublishSize) + wsEnvelopeOverhead,
+		clock:          cfg.clock,
+		credentials:    credentials,
+		queryParamAuth: cfg.queryParamAuth,
 	}
+}
+
+// applyCredential returns the dial URL and HTTP headers for the current
+// credential: query params under WithQueryParamAuth, otherwise Authorization /
+// X-API-Key headers. A nil credentials func (WithNoAuth) dials bare.
+func (t *wsTransport) applyCredential() (string, http.Header, error) {
+	if t.credentials == nil {
+		return t.url, nil, nil
+	}
+	token, apiKey := t.credentials()
+	if token == "" && apiKey == "" {
+		return t.url, nil, nil
+	}
+	if t.queryParamAuth {
+		dialURL, err := authQueryURL(t.url, token, apiKey)
+		return dialURL, nil, err
+	}
+	h := http.Header{}
+	if token != "" {
+		h.Set(headerAuthorization, authBearerPrefix+token)
+	}
+	if apiKey != "" {
+		h.Set(headerAPIKey, apiKey)
+	}
+	return t.url, h, nil
 }
 
 func (t *wsTransport) Capabilities() Capabilities {
 	return capabilitiesFor(TransportWebSocket)
 }
 
-// Open dials and completes the WebSocket handshake.
+// Open dials and completes the WebSocket handshake, presenting the current
+// credential (header or query per WithQueryParamAuth).
 func (t *wsTransport) Open(ctx context.Context) (Conn, error) {
-	conn, resp, err := websocket.Dial(ctx, t.url, &websocket.DialOptions{HTTPClient: t.httpClient})
+	dialURL, header, err := t.applyCredential()
+	if err != nil {
+		return nil, fmt.Errorf("sukko: building the dial URL: %w", err)
+	}
+	conn, resp, err := websocket.Dial(ctx, dialURL, &websocket.DialOptions{
+		HTTPClient: t.httpClient,
+		HTTPHeader: header,
+	})
 	// The upgrade response body is closed here — on success it is empty, on
 	// failure it is read by handshakeErrorFromResponse before this defer runs.
 	if resp != nil && resp.Body != nil {

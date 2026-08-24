@@ -88,6 +88,10 @@ var (
 	// ErrPublishRequiresJWT means publishing was attempted with an API key
 	// alone. Checked locally from the SDK's own credential state.
 	ErrPublishRequiresJWT = errors.New("sukko: publishing requires a JWT, not an API key")
+
+	// ErrEmptyToken means UpdateToken was called with an empty string. A
+	// store-only credential update to nothing is a caller mistake, not a no-op.
+	ErrEmptyToken = errors.New("sukko: UpdateToken requires a non-empty token")
 )
 
 // CodeNotAvailable is the wire code the server sends when position-anchored

@@ -61,6 +61,13 @@ const (
 	// MinChannelParts is the minimum number of dot-separated parts in a channel:
 	// "{tenant}.{suffix}" is at least two.
 	MinChannelParts = 2
+
+	// MaxTokenSourceAttempts is how many consecutive TokenSource failures are
+	// tolerated on the connected refresh path before the client terminates with
+	// ErrTokenSourceFailed. The count is consecutive and resets on any success. A
+	// TokenSource failure DURING a reconnect is non-terminal (FR-005): the client
+	// keeps backing off rather than dialing a credential it knows is dead.
+	MaxTokenSourceAttempts = 5
 )
 
 // Timing defaults. Every one of these is driven through the injectable Clock,
