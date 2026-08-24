@@ -114,7 +114,8 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 
 	var (
 		inFlight, pending bool
-		exp               int64     // last known credential expiry (unix seconds; 0 = never)
+		exp               int64     // last auth_ack expiry (unix seconds; 0 = never/unknown)
+		ownerExpiry       time.Time // last Token.Expiry from a fetch (zero = unknown)
 		lastAuthSent      time.Time // for the RefreshMinInterval floor
 		refreshTimer      Timer     // the proactive/reactive refresh schedule; nil = disarmed
 		refreshC          <-chan time.Time
@@ -133,6 +134,37 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		disarmRefresh()
 		refreshTimer = c.clock.NewTimer(max(after, 0), purposeRefresh)
 		refreshC = refreshTimer.C()
+	}
+	// armProactive arms the next refresh from the EARLIER of the two known
+	// expiries (ADR-0004): the server's auth_ack.exp and the caller's Token.Expiry.
+	// Either alone suffices; Token.Expiry is what gives a TokenSource client a
+	// schedule before any auth_ack (the handshake sends none). Neither known → no
+	// proactive timer. Floored so it never schedules within RefreshMinInterval of
+	// the last auth.
+	armProactive := func() {
+		var refreshAt time.Time
+		if exp != 0 {
+			refreshAt = time.Unix(exp, 0).Add(-c.cfg.refreshLead)
+		}
+		if !ownerExpiry.IsZero() {
+			fromToken := ownerExpiry.Add(-c.cfg.refreshLead)
+			if refreshAt.IsZero() || fromToken.Before(refreshAt) {
+				refreshAt = fromToken
+			}
+		}
+		if refreshAt.IsZero() {
+			disarmRefresh()
+			return
+		}
+		if floor := lastAuthSent.Add(c.cfg.refreshMinInterval); refreshAt.Before(floor) {
+			refreshAt = floor
+		}
+		armRefresh(refreshAt.Sub(c.clock.Now()))
+	}
+	// armReactive schedules a refresh after an auth_error, floored so an
+	// auth_error → refresh storm is impossible.
+	armReactive := func() {
+		armRefresh(lastAuthSent.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()))
 	}
 	advance := func() {
 		if inFlight || !pending {
@@ -190,6 +222,12 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			}
 			tokenFailCount = 0
 			c.creds.setToken(tok.Value)
+			if !tok.Expiry.IsZero() {
+				// A caller-authoritative expiry arms the proactive schedule now,
+				// without waiting for an auth_ack the handshake never sends.
+				ownerExpiry = tok.Expiry
+				armProactive()
+			}
 			token = tok.Value
 		} else {
 			token, _ = c.creds.snapshot()
@@ -203,25 +241,6 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			pending = false
 			lastAuthSent = c.clock.Now()
 		}
-	}
-	// armProactive arms the next refresh from the known expiry, floored so it never
-	// schedules within RefreshMinInterval of the last auth. exp == 0 (never
-	// expires) disarms — nothing to refresh ahead of.
-	armProactive := func() {
-		if exp == 0 {
-			disarmRefresh()
-			return
-		}
-		refreshAt := time.Unix(exp, 0).Add(-c.cfg.refreshLead)
-		if floor := lastAuthSent.Add(c.cfg.refreshMinInterval); refreshAt.Before(floor) {
-			refreshAt = floor
-		}
-		armRefresh(refreshAt.Sub(c.clock.Now()))
-	}
-	// armReactive schedules a refresh after an auth_error, floored so an
-	// auth_error → refresh storm is impossible.
-	armReactive := func() {
-		armRefresh(lastAuthSent.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()))
 	}
 
 	for {

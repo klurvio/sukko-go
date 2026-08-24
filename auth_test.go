@@ -483,6 +483,38 @@ func TestTokenSourcePanicContained(t *testing.T) {
 	}
 }
 
+// TestTokenSourceExpiryArmsProactiveWithoutAck pins the Token.Expiry arming: a
+// fetched Token{Expiry} schedules the next proactive refresh with no auth_ack from
+// the server — the handshake sends none, so Token.Expiry is a TokenSource client's
+// only way to refresh ahead of expiry.
+func TestTokenSourceExpiryArmsProactiveWithoutAck(t *testing.T) {
+	f := newFakeWS(t)
+	// The server acks (clearing the flight) but with exp:0 — "never/unknown" — so
+	// the proactive SCHEDULE can only come from Token.Expiry, not auth_ack.exp.
+	f.script(epochScript{respond: map[string][]string{typeAuth: {`{"type":"auth_ack","data":{"exp":0}}`}}})
+	// The fake clock's base is 2026-01-01 UTC; expire one hour out.
+	expiry := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+	ts := func(context.Context) (Token, error) { return Token{Value: "tok", Expiry: expiry}, nil }
+	c, fc := authClient(t, f, WithToken("static"), WithTokenSource(ts),
+		WithRand(newFakeRand()), WithHeartbeatInterval(time.Hour))
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	// Bootstrap the first fetch: it stores Token.Expiry and arms the proactive timer.
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	waitForFrameCount(t, f, typeAuth, 1)
+
+	// Advancing to Token.Expiry − RefreshLead fires the proactive schedule and the
+	// SDK refreshes on its own — with no auth_ack ever received.
+	fc.BlockUntilTimer(purposeRefresh)
+	fc.Advance(expiry.Add(-DefaultRefreshLead).Sub(fc.Now()))
+	waitForFrameCount(t, f, typeAuth, 2)
+}
+
 // waitForTokenSourceError polls the collected events for a *TokenSourceError.
 func waitForTokenSourceError(t *testing.T, ec *eventCollector) *TokenSourceError {
 	t.Helper()
