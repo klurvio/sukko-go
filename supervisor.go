@@ -56,7 +56,19 @@ type terminationOutcome struct {
 }
 
 // run is the supervisor goroutine. connectCtx bounds only the first dial.
+//
+//nolint:contextcheck // the auth-owner and every epoch derive from the stored client-lifetime context (rootCtx), NOT connectCtx — connectCtx bounds only the first dial and is deliberately not inherited by the supervisor-lifetime goroutines.
 func (c *Client) run(connectCtx context.Context) {
+	// The auth-owner is a supervisor-lifetime goroutine, launched once here and
+	// living across epochs. It MUST be torn down before terminalSequence closes
+	// the transport and Messages(): a terminal failure never cancels rootCtx, so
+	// an owner left running would write a dying socket and — once it emits
+	// *TokenSourceError (next increment) — send on a closed channel and panic.
+	// Stopping it here is correct today and future-proofs that emission.
+	ownerCtx, ownerCancel := context.WithCancel(c.rootCtx)
+	var ownerWg sync.WaitGroup
+	ownerWg.Go(func() { c.runAuthOwner(ownerCtx) })
+
 	// One combined exit defer (§VII: recover is effectively first, and the
 	// terminal sequence runs after the cause is set). On a panic the recover
 	// sets the cause BEFORE terminalSequence delivers *Terminal, so the caller
@@ -75,6 +87,10 @@ func (c *Client) run(connectCtx context.Context) {
 			c.cfg.logger.Error("sukko: supervisor panic", "value", fmt.Sprint(r))
 			c.transition(triggerTerminalFailure)
 		}
+		// Cancel and wait for the auth-owner before closing Messages() — cancel
+		// then Wait, never the reverse (its select escapes on ownerCtx.Done()).
+		ownerCancel()
+		ownerWg.Wait()
 		c.terminalSequence()
 	}()
 
@@ -151,6 +167,9 @@ func (c *Client) run(connectCtx context.Context) {
 		c.transition(triggerHandshakeOK) // connecting/reconnecting → connected
 
 		out, rootStopped := c.runEpoch(conn)
+		// The epoch ended: tell the auth-owner to abandon any refresh that was
+		// outstanding on this now-dead connection (its answer will never arrive).
+		c.resetAuthOwner()
 		// Discriminate on cause, not outcome (as the dial path does): if Close or a
 		// lifetime cancel raced the epoch's end — even if the heartbeat or a panic
 		// won the first-cause slot first, making rootStopped false — the caller's
@@ -445,6 +464,19 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		return
 	}
 
+	// auth_ack and auth_error answer an in-flight refresh: poke the auth-owner so
+	// it clears its single-flight marker. auth_ack is otherwise silent here (its
+	// exp/mode side effects and the *Authenticated emission land with the
+	// refresh-arming logic); auth_error still flows to surfaceEvent below, so its
+	// *AuthError is forwarded in receive order.
+	switch decoded.(type) {
+	case *wireAuthAck:
+		c.pokeAuthOwner()
+		return
+	case *wireAuthError:
+		c.pokeAuthOwner()
+	}
+
 	ev, serr := surfaceEvent(decoded)
 	switch {
 	case serr == nil:
@@ -525,6 +557,15 @@ func (c *Client) setConn(conn Conn) {
 	c.mu.Lock()
 	c.conn = conn
 	c.mu.Unlock()
+}
+
+// currentConn returns the live connection for the auth-owner to send `auth` on,
+// or nil between epochs. A send on a just-closed conn returns an error the owner
+// treats as a no-op, so a small stale window is harmless.
+func (c *Client) currentConn() Conn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn
 }
 
 func (c *Client) setErr(err error) {

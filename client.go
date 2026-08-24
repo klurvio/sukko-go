@@ -37,6 +37,18 @@ type Client struct {
 	// Buffered so the supervisor never blocks on it even if Connect has already
 	// returned on its own context deadline.
 	firstDial chan error
+	// authRefreshCmd carries a caller RefreshToken request to the auth-owner.
+	// Buffered(1) and sent non-blocking, so concurrent refresh requests coalesce
+	// (the owner also single-flights) and RefreshToken never blocks.
+	authRefreshCmd chan struct{}
+	// authPoke tells the auth-owner an auth_ack/auth_error arrived, completing the
+	// in-flight refresh. Buffered(1), sent non-blocking by the decode loop.
+	authPoke chan struct{}
+	// authEpochReset tells the auth-owner an epoch ended before its in-flight
+	// refresh was answered, so it must abandon that flight — the answer will never
+	// come on the new connection, and the reconnect re-auths via the dial
+	// credential. Buffered(1), sent non-blocking by the supervisor per epoch.
+	authEpochReset chan struct{}
 	// doneCh is closed by terminalSequence when teardown is complete.
 	doneCh chan struct{}
 	// terminalOnce guards the whole terminal sequence: it runs once whether the
@@ -91,18 +103,21 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 	}
 
 	c := &Client{
-		cfg:        cfg,
-		clock:      cfg.clock,
-		transport:  newWSTransport(url, cfg, credentials),
-		delivery:   newDelivery(cfg.queueSize, cfg.clock, counters),
-		counters:   counters,
-		creds:      creds,
-		redactor:   redactor,
-		rootCtx:    rootCtx,
-		rootCancel: rootCancel,
-		firstDial:  make(chan error, 1),
-		doneCh:     make(chan struct{}),
-		state:      StateDisconnected,
+		cfg:            cfg,
+		clock:          cfg.clock,
+		transport:      newWSTransport(url, cfg, credentials),
+		delivery:       newDelivery(cfg.queueSize, cfg.clock, counters),
+		counters:       counters,
+		creds:          creds,
+		redactor:       redactor,
+		rootCtx:        rootCtx,
+		rootCancel:     rootCancel,
+		firstDial:      make(chan error, 1),
+		authRefreshCmd: make(chan struct{}, 1),
+		authPoke:       make(chan struct{}, 1),
+		authEpochReset: make(chan struct{}, 1),
+		doneCh:         make(chan struct{}),
+		state:          StateDisconnected,
 	}
 
 	// Canceling the client-lifetime context tears the client down like Close.
@@ -260,6 +275,28 @@ func (c *Client) Iter(ctx context.Context) iter.Seq[Event] {
 			}
 		}
 	}
+}
+
+// RefreshToken triggers an immediate credential refresh: the SDK sends an `auth`
+// frame with the current JWT on the live connection. It is fire-and-forget
+// (FR-001b) and single-flight — concurrent calls coalesce into one in-flight
+// refresh — and a no-op while disconnected, since a reconnect re-authenticates via
+// the dial credential. It returns ErrClosed once the client is closed.
+func (c *Client) RefreshToken(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("sukko: refresh token: %w", err)
+	}
+	c.mu.Lock()
+	closed := c.closed || c.state == StateClosed || c.state == StateError
+	c.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
+	select {
+	case c.authRefreshCmd <- struct{}{}:
+	default: // a refresh is already queued; coalesce
+	}
+	return nil
 }
 
 // UpdateToken stores a JWT for the next connect and the next auth refresh. It is

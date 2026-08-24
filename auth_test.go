@@ -75,6 +75,124 @@ func TestDialAppliesCredential(t *testing.T) {
 	}
 }
 
+// TestRefreshTokenSingleFlight covers the single-flight guarantee: a refresh
+// while one is already outstanding (no auth_ack yet) coalesces — the SDK sends
+// exactly one `auth` frame, carrying the current token.
+func TestRefreshTokenSingleFlight(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{}) // no reply to `auth` → auth_ack withheld, the flight stays open
+	c := authClient(t, f, WithToken("jwt-1"))
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	waitForFrameCount(t, f, typeAuth, 1)
+
+	// A second refresh while the first is still in flight must coalesce.
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken #2: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // let a would-be second send appear
+	if got := len(f.framesOfType(typeAuth)); got != 1 {
+		t.Errorf("auth frames = %d, want 1 (the 2nd refresh must coalesce)", got)
+	}
+	if raw := f.framesOfType(typeAuth)[0].raw; !strings.Contains(raw, "jwt-1") {
+		t.Errorf("auth frame = %s, want it to carry the current token", raw)
+	}
+}
+
+// TestRefreshTokenAckClearsInFlight covers the flight completing: an auth_ack
+// clears the single-flight marker, so a subsequent refresh sends again.
+func TestRefreshTokenAckClearsInFlight(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{respond: map[string][]string{typeAuth: {`{"type":"auth_ack","data":{"exp":0}}`}}})
+	c := authClient(t, f, WithToken("jwt-1"))
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	waitForFrameCount(t, f, typeAuth, 1)
+
+	// A SINGLE second refresh must produce a second auth frame — deferred via the
+	// pending flag until the auth_ack clears the flight, never dropped. A retry
+	// loop here would mask the random-select coalescing bug (finding B).
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken #2: %v", err)
+	}
+	waitForFrameCount(t, f, typeAuth, 2)
+}
+
+// TestRefreshTokenSurvivesReconnect pins finding A: a refresh in flight when the
+// connection drops must not wedge single-flight. Epoch 1 closes (reconnect-class)
+// right after receiving the auth frame without answering it; after the reconnect,
+// RefreshToken must send again rather than silently no-op forever.
+func TestRefreshTokenSurvivesReconnect(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(
+		epochScript{closeAfterFrames: 1, closeAfter: 1011},
+		epochScript{},
+	)
+	fc := newFakeClock()
+	c, err := NewClient(context.Background(), f.URL(),
+		WithHTTPClient(f.client()), WithClock(fc), WithRand(newFakeRand()), WithToken("jwt-1"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+		ec.waitClosed(t)
+	}()
+
+	// Refresh on epoch 1 → auth frame sent; epoch 1 then closes without answering.
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	waitForFrameCount(t, f, typeAuth, 1)
+
+	// Reconnect to epoch 2 and let it come fully up.
+	fc.BlockUntilTimer(purposeBackoff)
+	fc.Advance(DefaultBackoff.Initial)
+	waitForDialCount(t, f, 2)
+	waitForState(t, c, StateConnected)
+
+	// The wedge bug (inFlight stuck true) would make this a permanent no-op.
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken after reconnect: %v", err)
+	}
+	waitForFrameCount(t, f, typeAuth, 2)
+	auths := f.framesOfType(typeAuth)
+	if last := auths[len(auths)-1]; last.epoch != 2 {
+		t.Errorf("second auth frame on epoch %d, want 2 (post-reconnect)", last.epoch)
+	}
+}
+
+// waitForState polls until the client reaches the given connection state.
+func waitForState(t *testing.T, c *Client, want ConnectionState) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for c.State() != want {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for state %v (have %v)", want, c.State())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
 // TestQueryParamDialErrorRedactsToken pins the §IX fix: a failed dial under
 // WithQueryParamAuth returns Go's *url.Error, which embeds the dial URL with the
 // token in it — and the SDK must redact that before the error reaches the caller.
