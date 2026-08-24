@@ -37,12 +37,18 @@ type Client struct {
 	terminalOnce sync.Once
 
 	// mu guards the fields below.
-	mu      sync.Mutex
-	state   ConnectionState
-	err     error
-	conn    Conn
-	started bool // the supervisor was launched (Connect called)
-	closed  bool // Close was called
+	mu    sync.Mutex
+	state ConnectionState
+	// err is the Err() value: nil on every clean stop (Close, lifetime cancel,
+	// or the WithReconnect(false) downgrade), the failure otherwise.
+	err error
+	// terminalCause is the *Terminal.Err value. It diverges from err on the
+	// WithReconnect(false) downgrade, where the contract says *Terminal carries
+	// the close cause for diagnosis while Err() stays nil.
+	terminalCause error
+	conn          Conn
+	started       bool // the supervisor was launched (Connect called)
+	closed        bool // Close was called
 }
 
 // NewClient builds a client for a URL. It validates the configuration and fails
@@ -96,7 +102,7 @@ func (c *Client) onLifetimeCancel() {
 	c.closed = true
 	c.mu.Unlock()
 
-	c.transition(context.Background(), triggerCloseCalled)
+	c.transition(triggerCloseCalled)
 	c.terminalSequence()
 }
 
@@ -127,9 +133,18 @@ func (c *Client) Connect(ctx context.Context) error {
 	case err := <-c.firstDial:
 		return err
 	case <-c.doneCh:
-		// The supervisor exited before reporting a dial outcome (e.g. a panic in
-		// the dial path). Report the terminal cause rather than block forever.
-		return c.Err()
+		// The supervisor exited. If Close (or a lifetime cancel) raced the first
+		// dial, BOTH firstDial and doneCh are ready and a bare select would pick
+		// at random — returning Err() (nil on a clean stop) would report a false
+		// success on an already-closed client. The first dial's outcome is always
+		// sent before doneCh closes, so prefer it; fall back to Err() only when no
+		// outcome was reported (a panic before the firstDial send).
+		select {
+		case err := <-c.firstDial:
+			return err
+		default:
+			return c.Err()
+		}
 	case <-ctx.Done():
 		return fmt.Errorf("sukko: connect: %w", ctx.Err())
 	}
@@ -155,8 +170,7 @@ func (c *Client) Close(ctx context.Context) error {
 	// so Close does it. started cannot flip to true after closed is set, so
 	// there is no orphaned supervisor.
 	if !started {
-		//nolint:contextcheck // no epoch context exists on the never-connected close path; Background is the correct empty parent.
-		c.transition(context.Background(), triggerCloseCalled)
+		c.transition(triggerCloseCalled)
 		c.terminalSequence()
 	}
 
@@ -190,8 +204,10 @@ func (c *Client) State() ConnectionState {
 }
 
 // Err returns the terminal cause after Messages() has closed: nil after a clean
-// stop (Close or lifetime cancellation), the failure otherwise. The channel
-// close is the happens-before edge that makes it race-free to read after close.
+// stop — Close, lifetime cancellation, OR the WithReconnect(false) downgrade of a
+// reconnect-class outcome (where *Terminal.Err still carries the cause for
+// diagnosis) — and the failure otherwise. The channel close is the happens-before
+// edge that makes it race-free to read after close.
 func (c *Client) Err() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

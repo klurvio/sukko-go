@@ -189,6 +189,26 @@ func (d *delivery) sendTerminal(t *Terminal) bool {
 	}
 }
 
+// isParked reports whether any send is currently parked on back-pressure. The
+// heartbeat's pong-deadline path reads it to suspend the deadline while the
+// decode loop is stalled, so the SDK never preempts the server's own slow-client
+// (1008) verdict.
+func (d *delivery) isParked() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.parked > 0
+}
+
+// parkEpisodes returns the count of back-pressure episodes begun so far (a 0→1
+// parked transition). The heartbeat samples it when it arms a pong deadline and
+// again when the deadline fires: a change means the decode loop was parked at
+// some point during the window (so a missed pong is the slow consumer's doing,
+// not a dead link), which point-sampling isParked() at fire-time alone would miss
+// while a backlog drains.
+func (d *delivery) parkEpisodes() int64 {
+	return d.counters.backpressureBlocks.Load()
+}
+
 // enterParkedLocked records that a send has parked. The back-pressure episode
 // begins on the 0→1 parked transition — a second sender parking during an open
 // episode joins it rather than starting a new one — and any test waiter is

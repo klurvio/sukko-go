@@ -113,16 +113,18 @@ const (
 
 // WebSocket close codes the SDK originates.
 //
-// The 4000-4999 range is private-use per RFC 6455 §7.4.2. The platform
-// allocates from the bottom of that range, so the SDK allocates from the top:
-// opposite ends cannot collide as either side adds codes. Vendor banding
-// conventions (Pusher's 4000-4099 "do not reconnect", for example) govern
-// server-to-client codes and do not apply to a code the client sends.
+// Code 4000 is reused for two meanings disambiguated by DIRECTION, exactly as
+// the AsyncAPI contract's close-code table and both sibling SDKs (@sukko/sdk,
+// sukko-py) define it: a REMOTE 4000 is the operator's force-disconnect, a LOCAL
+// 4000 is the client's own heartbeat-timeout close. Numeric parity with the
+// contract wins over any private allocation scheme (§I); the close-policy table
+// keeps the two 4000 rows apart by direction (§XVIII: matches the siblings).
 const (
-	// CloseCodeHeartbeatTimeout is sent when no pong arrives within
-	// PongTimeout. It is client-originated, which is what distinguishes it from
-	// a server close in the close-code policy.
-	CloseCodeHeartbeatTimeout = 4999
+	// CloseCodeHeartbeatTimeout is sent (LOCAL) when no pong arrives within
+	// PongTimeout. It shares its value (4000) with the server's REMOTE
+	// force-disconnect and is told apart from it by close direction — the
+	// contract's rule, mirrored by @sukko/sdk and sukko-py.
+	CloseCodeHeartbeatTimeout = 4000
 )
 
 // BackoffConfig parameterises reconnect backoff. Attempt n (n = 0 for the first

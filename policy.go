@@ -79,13 +79,20 @@ type closeOutcome struct {
 	countsTowardBackpressure bool
 }
 
+// closeCodeForceDisconnect is the operator force-disconnect the server sends
+// (AsyncAPI force_disconnect). It shares code 4000 with the client's own
+// heartbeat-timeout close (CloseCodeHeartbeatTimeout); the two are distinguished
+// only by direction, so both are named rather than written as a bare 4000 (§I).
+const closeCodeForceDisconnect = 4000
+
 // closeBaseRows maps a close to its classification with reconnect enabled.
 // Applying WithReconnect(false) is a uniform transformation over this table
 // rather than a second copy of it — see lookupClosePolicy.
 //
-// A local 4000 is deliberately absent: the SDK allocates from the top of the
-// application range, so an observed 4000 is unambiguously the server's
-// force-disconnect and the direction alone identifies it.
+// Code 4000 appears in BOTH directions, disambiguated per the contract: a REMOTE
+// 4000 is the operator force-disconnect (terminal); a LOCAL 4000 is the client's
+// own heartbeat-timeout close (reconnect). The {code, direction} key keeps the
+// two rows distinct — matching the contract and both sibling SDKs (§XVIII).
 var closeBaseRows = map[struct {
 	code      int
 	direction closeDirection
@@ -96,8 +103,8 @@ var closeBaseRows = map[struct {
 	{1006, directionLocal}:  {class: classReconnect, surfacesCloseError: true},
 	{1008, directionRemote}: {class: classReconnect, surfacesCloseError: true, countsTowardBackpressure: true},
 	{1011, directionRemote}: {class: classReconnect, surfacesCloseError: true},
-	{4000, directionRemote}: {class: classTerminal, surfacesCloseError: true},
 
+	{closeCodeForceDisconnect, directionRemote}: {class: classTerminal, surfacesCloseError: true},
 	{CloseCodeHeartbeatTimeout, directionLocal}: {class: classReconnect, surfacesCloseError: true},
 }
 

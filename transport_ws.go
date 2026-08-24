@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -72,6 +73,10 @@ func (t *wsTransport) Open(ctx context.Context) (Conn, error) {
 // wsConn is one live WebSocket connection.
 type wsConn struct {
 	conn *websocket.Conn
+	// closeOnce guards Close: the heartbeat-timeout path and terminalSequence can
+	// both close the same conn, and coder/websocket's Close is not idempotent
+	// (§VII: exactly-once close). The first call wins; later calls are no-ops.
+	closeOnce sync.Once
 }
 
 // Read returns the next frame, or translates a close/failure into a typed error.
@@ -95,6 +100,14 @@ func (c *wsConn) Read(ctx context.Context) ([]byte, error) {
 		if errors.As(err, &ce) {
 			reason = ce.Reason
 		}
+		// A coded close frame surfaced through Read is attributed to the server.
+		// This holds for every close the SDK observes today because the SDK only
+		// closes in terminalSequence (a clean local 1000, never read back as an
+		// epoch termination). When the heartbeat slice adds a client-initiated
+		// CloseCodeHeartbeatTimeout (4999), that close MUST NOT be classified from
+		// this remote-labeled path — the {4999, local} reconnect row would be
+		// missed and it would read as an unenumerated remote close (terminal). The
+		// heartbeat path classifies its own local close directly.
 		return nil, &CloseError{Code: int(code), Direction: directionRemote, Reason: reason}
 	}
 
@@ -118,12 +131,17 @@ func (c *wsConn) Send(ctx context.Context, frame []byte) error {
 	return nil
 }
 
-// Close initiates a local close with the given code and reason.
+// Close initiates a local close with the given code and reason. It is idempotent
+// via closeOnce: the heartbeat-timeout close and terminalSequence's close both
+// target the same conn.
 func (c *wsConn) Close(code int, reason string) error {
-	if err := c.conn.Close(websocket.StatusCode(code), reason); err != nil {
-		return fmt.Errorf("sukko: websocket close: %w", err)
-	}
-	return nil
+	var err error
+	c.closeOnce.Do(func() {
+		if e := c.conn.Close(websocket.StatusCode(code), reason); e != nil {
+			err = fmt.Errorf("sukko: websocket close: %w", e)
+		}
+	})
+	return err
 }
 
 // handshakeBody is the gateway's error response body on a rejected upgrade.

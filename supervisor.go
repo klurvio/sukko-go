@@ -6,19 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sync"
+	"time"
 )
 
 // The supervisor is the client-lifetime goroutine that owns the connection: it
-// dials, runs the decode loop for one epoch, and — on every exit path — performs
-// the terminal sequence (set the terminal cause, close the transport, deliver
-// the final *Terminal into its reserved slot, close Messages()). Close does NOT
-// perform that sequence; it cancels the root and waits, and the supervisor's own
-// exit does the teardown. That inversion is what makes "Messages() is closed by
+// dials, runs the decode loop for one epoch, classifies how the epoch ended,
+// backs off, and re-dials — and, on every exit path, performs the terminal
+// sequence (set the terminal cause, close the transport, deliver the final
+// *Terminal into its reserved slot, close Messages()). Close does NOT perform
+// that sequence; it cancels the root and waits, and the supervisor's own exit
+// does the teardown. That inversion is what makes "Messages() is closed by
 // exactly one goroutine" literal and keeps a terminal failure (which runs with
 // no Close in flight) on the same path as a clean stop.
 //
-// This slice runs a single epoch — reconnect (the redial loop around runEpoch)
-// lands in the next slice.
+// Termination classification is driven entirely from the policy tables in
+// policy.go — closePolicy, handshakePolicy, and (in a later slice)
+// internalCausePolicy — so a class the tables enumerate is the class the loop
+// enacts, with no second copy of the rules here.
 
 // closeCodeNormalClosure is the RFC 6455 normal-closure code the SDK sends on a
 // clean local close. coder/websocket usually kills the socket first when the
@@ -26,57 +31,151 @@ import (
 // pinned close ordering accepts that.
 const closeCodeNormalClosure = 1000
 
-// run is the supervisor goroutine. connectCtx bounds only the first dial.
-//
-//nolint:contextcheck // by design the epoch and every downstream context derive from the stored client-lifetime context (rootCtx), NOT from connectCtx — connectCtx bounds only the first dial and is deliberately not inherited by the running connection (the "Connect ctx does not tear down a live connection" rule).
-func (c *Client) run(connectCtx context.Context) {
-	epochCtx, epochCancel := context.WithCancel(c.rootCtx)
+// terminationOutcome is the classified result of an epoch ending or a dial
+// failing. It is what the classifiers return and what applyOutcome enacts, so
+// the "what class is this" decision (the policy tables) and the "what do we do
+// about it" decision (the loop) are separated.
+type terminationOutcome struct {
+	class terminationClass
+	// cause is the failure carried on Err()/*Terminal.Err for a terminal stop,
+	// on *Terminal.Err alone for the WithReconnect(false) downgrade, and unused
+	// for a reconnect-class outcome.
+	cause error
+	// surface is the in-band event emitted before terminating or reconnecting —
+	// the *CloseError on a coded close (when the policy's surfacesCloseError is
+	// set) or the *HandshakeError on a failed upgrade. nil when the ending has no
+	// server-originated outcome to report (a network dial error).
+	surface Event
+	// trigger drives the state machine.
+	trigger trigger
+	// retryAfter, when non-nil, overrides the NEXT reconnect attempt's backoff
+	// delay — the handshake-429 tenant-limit case where the server's own hint
+	// beats the client's exponential guess. A present zero means "dial
+	// immediately".
+	retryAfter *time.Duration
+}
 
+// run is the supervisor goroutine. connectCtx bounds only the first dial.
+func (c *Client) run(connectCtx context.Context) {
 	// One combined exit defer (§VII: recover is effectively first, and the
 	// terminal sequence runs after the cause is set). On a panic the recover
 	// sets the cause BEFORE terminalSequence delivers *Terminal, so the caller
-	// never gets *Terminal{Err: nil} for a crash.
+	// never gets *Terminal{Err: nil} for a crash. (The full in-band
+	// *InternalError emission + epoch-failure reconnect land with the shared
+	// recover helper in a later slice; here a panic is terminal.)
 	defer func() {
 		if r := recover(); r != nil {
-			// A recovered panic becomes a typed *InternalError, so the cause on
-			// Err() and the final *Terminal is errors.As-matchable and carries the
-			// stack. (Full in-band *InternalError emission and epoch-failure land
-			// with the recover helper in a later slice; here a panic is terminal.)
-			c.setErrIfNil(&InternalError{
+			ie := &InternalError{
 				Op:    "supervisor",
 				Value: fmt.Sprint(r),
 				Stack: string(debug.Stack()),
-			})
+			}
+			c.setErrIfNil(ie)
+			c.setTerminalCauseIfNil(ie)
 			c.cfg.logger.Error("sukko: supervisor panic", "value", fmt.Sprint(r))
-			c.transition(epochCtx, triggerTerminalFailure)
+			c.transition(triggerTerminalFailure)
 		}
 		c.terminalSequence()
 	}()
-	// epochCtx is dead before the exit defer runs (LIFO), so any teardown-path
-	// send discards instead of parking on a hung consumer (never blocks close).
-	defer epochCancel()
 
-	c.transition(epochCtx, triggerConnectCalled) // disconnected → connecting
+	c.transition(triggerConnectCalled) // disconnected → connecting
 
-	conn, err := c.dial(connectCtx)
-	if err != nil {
-		c.firstDial <- err
-		// Discriminate on cause, not outcome: a dial aborted because Close or the
-		// lifetime context canceled the root is a clean stop, not a failure —
-		// the same rule runEpoch applies to a mid-epoch read error. Only a real
-		// dial/handshake failure is terminal.
+	// attempt is the backoff exponent for the NEXT reconnect dial: 0 for the
+	// first reconnect after an epoch ends or a first dial fails, incremented per
+	// consecutive failed reconnect, and reset only on a successful re-handshake
+	// (never on a failed dial), so a flapping connection keeps backing off.
+	attempt := 0
+	firstDialReported := false
+	var override *time.Duration
+
+	for {
+		if firstDialReported {
+			// Reconnect: wait out the backoff (or the server's Retry-After
+			// override), then dial. Root cancellation during the wait is a clean
+			// stop.
+			// A pending Retry-After override replaces this attempt's delay and
+			// draws no randomness; otherwise the pinned formula. override is
+			// reassigned on every path below (a fresh failure sets it, a handshake
+			// clears it) before it is next read, so it needs no explicit reset here.
+			var delay time.Duration
+			if override != nil {
+				delay = *override
+			} else {
+				delay = computeBackoffDelay(c.cfg.backoff, attempt, c.cfg.rand)
+			}
+			if !c.backoffWait(delay) {
+				c.transition(triggerCloseCalled)
+				return
+			}
+			attempt++
+		}
+
+		wasFirst := !firstDialReported
+		conn, dialErr := c.acquireConn(connectCtx, wasFirst)
+		if wasFirst {
+			// Connect returns the first dial's outcome unconditionally (FR-001):
+			// nil on success, the typed error otherwise — and reconnect (when
+			// enabled) still proceeds in the background below.
+			c.firstDial <- dialErr
+			firstDialReported = true
+		}
+
+		if dialErr != nil {
+			// Discriminate on cause, not outcome: a dial aborted because Close or
+			// the lifetime context canceled the root is a clean stop, not a
+			// failure.
+			if c.rootCtx.Err() != nil {
+				c.transition(triggerCloseCalled)
+				return
+			}
+			out := c.classifyDial(connectCtx, dialErr, wasFirst)
+			if c.applyOutcome(out) {
+				return
+			}
+			override = out.retryAfter
+			continue
+		}
+
+		// Connected: reset the backoff and run the epoch.
+		c.setConn(conn)
+		// Close (or a lifetime cancel) can land exactly as the dial completes.
+		// Discriminate on cause: take the clean-stop exit rather than emit a
+		// spurious →connected the caller would see after Close. terminalSequence
+		// closes the stashed conn.
 		if c.rootCtx.Err() != nil {
-			c.transition(epochCtx, triggerCloseCalled)
+			c.transition(triggerCloseCalled)
 			return
 		}
-		c.classifyDialFailure(epochCtx, err)
-		return
-	}
-	c.setConn(conn)
-	c.firstDial <- nil
-	c.transition(epochCtx, triggerHandshakeOK) // connecting → connected
+		attempt = 0
+		override = nil
+		c.transition(triggerHandshakeOK) // connecting/reconnecting → connected
 
-	c.runEpoch(epochCtx, conn)
+		out, rootStopped := c.runEpoch(conn)
+		// Discriminate on cause, not outcome (as the dial path does): if Close or a
+		// lifetime cancel raced the epoch's end — even if the heartbeat or a panic
+		// won the first-cause slot first, making rootStopped false — the caller's
+		// stop wins. Otherwise a Close could surface a post-Close reconnect event,
+		// or deliver a non-nil *Terminal.Err for a clean stop under WithReconnect(false).
+		if rootStopped || c.rootCtx.Err() != nil {
+			c.transition(triggerCloseCalled)
+			return
+		}
+		if c.applyOutcome(out) {
+			return
+		}
+		// A reconnect-class epoch termination: attempt is already 0 (reset at the
+		// handshake), so the first reconnect after a healthy epoch waits Initial.
+	}
+}
+
+// acquireConn performs a dial: the first one bounded by the caller's connect
+// deadline, every reconnect bounded by the injectable "dial" timer.
+func (c *Client) acquireConn(connectCtx context.Context, first bool) (Conn, error) {
+	if first {
+		return c.dial(connectCtx)
+	}
+	//nolint:contextcheck // a reconnect dial is bounded by the stored client-lifetime context (rootCtx) plus the injectable dial timer, by design — there is no caller context to thread through, and using one would defeat the "a live reconnect is torn down only by the client lifetime" rule.
+	return c.reconnectDial()
 }
 
 // dial performs the first dial, bounded by the connect deadline AND the client
@@ -95,73 +194,268 @@ func (c *Client) dial(connectCtx context.Context) (Conn, error) {
 	return conn, nil
 }
 
-// runEpoch is the decode loop: the sole reader of the socket. When it parks on a
-// delivery send under back-pressure it stops reading, which is what closes the
-// TCP window. It returns when the epoch ends, having set the terminal state.
-func (c *Client) runEpoch(epochCtx context.Context, conn Conn) {
+// reconnectDial performs a reconnect dial bounded by the injectable "dial" timer
+// and the client lifetime. The timer goes through the Clock seam so a test drives
+// it deterministically (BlockUntilTimer("dial") → Advance(DialTimeout)); a watcher
+// goroutine cancels the dial when the timer fires and exits when the dial
+// completes, so no goroutine outlives the call (goleak stays clean).
+func (c *Client) reconnectDial() (Conn, error) {
+	dialCtx, cancel := context.WithCancel(c.rootCtx)
+	defer cancel()
+
+	timer := c.clock.NewTimer(c.cfg.dialTimeout, purposeDial)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		// Trivial channel select — panic-free; the shared recover helper (T077)
+		// is installed at every goroutine entry in a later slice.
+		select {
+		case <-timer.C():
+			cancel() // dial timed out
+		case <-dialCtx.Done():
+			timer.Stop()
+		}
+	})
+
+	conn, err := c.transport.Open(dialCtx)
+	cancel()  // wake the watcher on a completed dial before it can fire the timer path
+	wg.Wait() // the watcher has exited before we return
+	if err != nil {
+		return nil, fmt.Errorf("sukko: reconnect dial: %w", err)
+	}
+	return conn, nil
+}
+
+// backoffWait sleeps for delay on the injectable "backoff" timer, returning false
+// if the client lifetime ends first. A non-positive delay dials immediately (the
+// Retry-After: 0 case) without arming a timer.
+func (c *Client) backoffWait(delay time.Duration) bool {
+	if delay <= 0 {
+		return c.rootCtx.Err() == nil
+	}
+	timer := c.clock.NewTimer(delay, purposeBackoff)
+	defer timer.Stop()
+	select {
+	case <-timer.C():
+		return true
+	case <-c.rootCtx.Done():
+		return false
+	}
+}
+
+// runEpoch runs one connection epoch: it spawns the heartbeat goroutine and is
+// itself the decode loop — the sole reader of the socket. It returns the
+// classified termination (first-cause-wins across the decode loop and the
+// heartbeat goroutine) and whether the root was canceled (a clean stop, no
+// outcome). Both goroutines are torn down before it returns.
+func (c *Client) runEpoch(conn Conn) (out terminationOutcome, rootStopped bool) {
+	e := newEpoch(c.rootCtx)
+	// Registered FIRST so it runs LAST (LIFO): after the decode-loop recover
+	// (below) has had its chance to record a panic, cancel the epoch, wait for the
+	// heartbeat goroutine to exit, then read the recorded termination. A decode
+	// loop panic unwinds (it produces no read error), so reading the slot here —
+	// not off a return value — is what carries a panic outcome out.
+	defer func() {
+		e.cancel()
+		e.wg.Wait()
+		// Close the epoch's conn unconditionally (best-effort, idempotent via
+		// closeOnce). Most endings already closed it — a remote close, a 1006 drop,
+		// the 4999 heartbeat close, terminalSequence — but a decode-path PANIC does
+		// not: the goroutine was not parked in a Read, so ctx cancellation (which
+		// coder/websocket honors only for an in-flight Read/Write) never reaches the
+		// socket, and reconnecting would leak the fd and the server tenant slot.
+		_ = conn.Close(closeCodeNormalClosure, "")
+		out, rootStopped = e.result()
+	}()
+	defer c.recoverEpoch(e, "decode")
+
+	e.wg.Go(func() { c.runHeartbeat(e, conn) })
+
 	for {
-		data, err := conn.Read(epochCtx)
+		data, err := conn.Read(e.ctx)
 		if err == nil {
-			c.dispatch(epochCtx, data)
+			c.dispatch(e, data)
 			continue
 		}
 
-		// The root being canceled means Close or the lifetime context ended
-		// the epoch — a clean stop, no error to report.
+		// Priority: root cancel (a clean stop) first, then a termination already
+		// recorded by the heartbeat goroutine (a 4999 timeout or its own panic),
+		// then classify the read error itself.
 		if c.rootCtx.Err() != nil {
-			c.transition(epochCtx, triggerCloseCalled)
+			e.recordRootStop()
+			return
+		}
+		if e.hasTerminated() {
 			return
 		}
 
 		var ce *CloseError
 		if errors.As(err, &ce) {
-			c.classifyClose(epochCtx, ce)
+			e.record(c.classifyClose(ce))
 			return
 		}
-		// An unexpected read error with the root still live.
-		c.setErr(fmt.Errorf("sukko: read: %w", err))
-		c.transition(epochCtx, triggerTerminalFailure)
+		// An unexpected read error with the root still live — terminal.
+		e.record(terminationOutcome{
+			class:   classTerminal,
+			cause:   fmt.Errorf("sukko: read: %w", err),
+			trigger: triggerTerminalFailure,
+		})
 		return
 	}
+}
+
+// applyOutcome enacts a classified outcome. It emits the outcome's surface event
+// (using the root context so a between-epochs lifecycle event parks until Close
+// rather than being discarded on epoch teardown), then acts on the class:
+// terminal and clean-stop set the terminal state and return true (the loop
+// exits); reconnect transitions to reconnecting and returns false (the loop
+// re-dials).
+func (c *Client) applyOutcome(out terminationOutcome) (done bool) {
+	if out.surface != nil {
+		c.surface(out.surface)
+	}
+	switch out.class {
+	case classReconnect:
+		c.transition(out.trigger) // → reconnecting
+		return false
+	case classCleanStop:
+		// The WithReconnect(false) downgrade: Err() stays nil, but *Terminal.Err
+		// carries the cause for diagnosis. (A genuine caller Close never reaches
+		// here — it ends the epoch via root cancellation, the rootStopped path.)
+		c.setTerminalCause(out.cause)
+		c.transition(out.trigger)
+		return true
+	default: // classTerminal
+		c.setErr(out.cause)
+		c.setTerminalCause(out.cause)
+		c.transition(out.trigger)
+		return true
+	}
+}
+
+// classifyDial resolves a failed dial to an outcome. first distinguishes the
+// caller's Connect(ctx) deadline (a dial-abort that keeps reconnecting in the
+// background) from a reconnect dial's own timeout.
+func (c *Client) classifyDial(connectCtx context.Context, err error, first bool) terminationOutcome {
+	var he *HandshakeError
+	if errors.As(err, &he) {
+		out := lookupHandshakePolicy(he.Status, he.Code, c.cfg.reconnect)
+		var retryAfter *time.Duration
+		if out.retryAfterOverrides && he.RetryAfter != nil {
+			retryAfter = he.RetryAfter
+		}
+		return terminationOutcome{
+			class:      out.class,
+			cause:      he,
+			surface:    he, // *HandshakeError is an Event, so a 429 loop is never silent
+			trigger:    triggerForClass(out.class),
+			retryAfter: retryAfter,
+		}
+	}
+
+	// A caller-ctx-expired FIRST dial is a dial-abort: reconnect keeps trying in
+	// the background (WithReconnect(false) downgrades it to a clean stop). Any
+	// other network/TLS error — or a reconnect dial's own timeout — is a plain
+	// reconnect-class failure.
+	trig := triggerReconnectClassFailure
+	if first && connectCtx.Err() != nil {
+		trig = triggerDialAborted
+	}
+	// Route the WithReconnect(false) downgrade through the single applyReconnectFlag
+	// rule rather than a fourth inline copy of it (file header: no second copy).
+	out := applyReconnectFlag(closeOutcome{class: classReconnect}, c.cfg.reconnect)
+	return terminationOutcome{class: out.class, cause: err, trigger: trig}
+}
+
+// classifyClose resolves a closed epoch to an outcome via the close policy.
+func (c *Client) classifyClose(ce *CloseError) terminationOutcome {
+	out, ok := lookupClosePolicy(closeKey{code: ce.Code, direction: ce.Direction, reconnectEnabled: c.cfg.reconnect})
+	if !ok {
+		// An unenumerated close code is terminal rather than silently reconnected.
+		return terminationOutcome{class: classTerminal, cause: ce, surface: ce, trigger: triggerTerminalFailure}
+	}
+
+	var surface Event
+	if out.surfacesCloseError {
+		surface = ce
+	}
+
+	switch out.class {
+	case classReconnect:
+		return terminationOutcome{class: classReconnect, cause: ce, surface: surface, trigger: triggerReconnectClassFailure}
+	case classCleanStop:
+		if out.surfacesCloseError {
+			// The WithReconnect(false) downgrade of a reconnect-class close:
+			// *CloseError, then *Terminal{cause}, then close, with Err() nil.
+			return terminationOutcome{class: classCleanStop, cause: ce, surface: ce, trigger: triggerReconnectClassFailure}
+		}
+		// A genuine local normal-closure — caller-driven, no cause to report.
+		return terminationOutcome{class: classCleanStop, trigger: triggerCloseCalled}
+	default: // classTerminal
+		return terminationOutcome{class: classTerminal, cause: ce, surface: surface, trigger: triggerTerminalFailure}
+	}
+}
+
+// triggerForClass maps a termination class to its state-machine trigger. The
+// clean-stop case is the WithReconnect(false) downgrade of a reconnect-class
+// outcome, so it carries the reconnect trigger — the state machine downgrades it
+// to StateClosed under the reconnect flag, keeping the class and the state in
+// agreement without a second rule here.
+func triggerForClass(class terminationClass) trigger {
+	if class == classTerminal {
+		return triggerTerminalFailure
+	}
+	return triggerReconnectClassFailure
 }
 
 // dispatch routes one decoded frame. Data and surfaced advisories go to the
 // delivery channel in receive order; unknown types surface as *UnknownEvent
 // (forward compatibility); control frames whose disposition is not "surface"
 // carry their effect in a later phase and surface nothing here.
-func (c *Client) dispatch(epochCtx context.Context, data []byte) {
+func (c *Client) dispatch(e *epoch, data []byte) {
 	decoded, unknown, err := decodeFrame(data)
 	if err != nil {
 		// Unreadable frame. Surfaced as a protocol error so drift is visible;
 		// the epoch-tear-on-non-JSON refinement (FR-002 liveness) is a later task.
-		c.forward(epochCtx, &ProtocolError{Message: "unreadable frame", Cause: err})
+		c.forward(e.ctx, &ProtocolError{Message: "unreadable frame", Cause: err})
 		return
 	}
 	if unknown != "" {
 		c.counters.unknownEvents.Add(1)
-		c.forward(epochCtx, &UnknownEvent{Type: unknown, Raw: bytes.Clone(data)})
+		c.forward(e.ctx, &UnknownEvent{Type: unknown, Raw: bytes.Clone(data)})
+		return
+	}
+
+	// A pong's whole effect is resetting the heartbeat's pong deadline; it
+	// surfaces nothing. Signal the heartbeat goroutine (non-blocking — a prior
+	// unconsumed signal already covers this pong).
+	if _, ok := decoded.(*wirePong); ok {
+		select {
+		case e.pongCh <- struct{}{}:
+		default:
+		}
 		return
 	}
 
 	ev, serr := surfaceEvent(decoded)
 	switch {
 	case serr == nil:
-		c.forward(epochCtx, ev)
+		c.forward(e.ctx, ev)
 	case errors.Is(serr, errNotSurfaceFrame):
-		// A control-derived (subscription_ack, auth_ack) or internal-silent
-		// (pong) frame. Its side effects — grant diff, auth mode, pong deadline
-		// — belong to later phases; none reach a client that cannot yet
-		// subscribe or authenticate.
+		// A control-derived (subscription_ack, auth_ack) frame. Its side effects —
+		// grant diff, auth mode — belong to later phases; none reach a client that
+		// cannot yet subscribe or authenticate.
 	default:
 		// A presence/protocol failure: surfaceEvent returned a *ProtocolError,
 		// which is itself an Event.
 		if pe, ok := serr.(Event); ok {
-			c.forward(epochCtx, pe)
+			c.forward(e.ctx, pe)
 		}
 	}
 }
 
-// forward sends an event to the delivery channel, counting the data plane.
+// forward sends a data or advisory event through the epoch context, counting the
+// data plane. An event forwarded during a live epoch is discarded if that epoch
+// tears down mid-send (the single-event carve-out).
 func (c *Client) forward(epochCtx context.Context, ev Event) {
 	if _, ok := ev.(*Message); ok {
 		c.counters.messagesReceived.Add(1)
@@ -169,58 +463,24 @@ func (c *Client) forward(epochCtx context.Context, ev Event) {
 	c.delivery.send(c.rootCtx, epochCtx, ev)
 }
 
-// classifyDialFailure sets the terminal state for a failed first dial.
-func (c *Client) classifyDialFailure(epochCtx context.Context, err error) {
-	c.setErr(err)
-
-	var he *HandshakeError
-	if errors.As(err, &he) {
-		out := lookupHandshakePolicy(he.Status, he.Code, c.cfg.reconnect)
-		if out.class == classTerminal {
-			c.transition(epochCtx, triggerTerminalFailure)
-			return
-		}
-		// classReconnect (and the reconnect-disabled downgrade) redial in the
-		// next slice; a single-epoch client ends here for now.
-		c.transition(epochCtx, triggerTerminalFailure)
-		return
-	}
-	// A network/TLS dial error or a canceled dial context.
-	c.transition(epochCtx, triggerTerminalFailure)
+// surface emits a lifecycle event (state change, close error, handshake error)
+// using the root context for BOTH delivery slots. These events are emitted
+// between epochs, when the epoch context is already dead, so they must park until
+// Close rather than be discarded on epoch teardown.
+func (c *Client) surface(ev Event) {
+	c.delivery.send(c.rootCtx, c.rootCtx, ev)
 }
 
-// classifyClose sets the terminal state for a closed epoch.
-func (c *Client) classifyClose(epochCtx context.Context, ce *CloseError) {
-	out, ok := lookupClosePolicy(closeKey{code: ce.Code, direction: ce.Direction, reconnectEnabled: c.cfg.reconnect})
-	if !ok || out.class == classTerminal {
-		c.setErr(ce)
-		c.transition(epochCtx, triggerTerminalFailure)
-		return
-	}
-	if out.class == classCleanStop {
-		// Slice-3 obligation: this branch is reachable only via the
-		// WithReconnect(false) downgrade, where the contract (events.go: Terminal
-		// docs) says *Terminal.Err carries the close cause while Err() stays nil.
-		// That needs a SECOND cause field — terminalSequence and Err() share one
-		// today — and must land when this classifier is rebuilt for reconnect,
-		// before the two collapse permanently.
-		c.transition(epochCtx, triggerCloseCalled)
-		return
-	}
-	// classReconnect redials in the next slice.
-	c.setErr(ce)
-	c.transition(epochCtx, triggerTerminalFailure)
-}
-
-// transition advances the state machine via a trigger and emits one
-// *StateChange per real transition. The target comes from the stateTransitions
-// table, never a hardcoded state, so a terminal failure lands in StateError and
-// a clean stop in StateClosed rather than the two collapsing. A trigger with no
-// defined transition from the current state is a no-op and emits nothing.
-func (c *Client) transition(epochCtx context.Context, tr trigger) {
+// transition advances the state machine via a trigger and emits one *StateChange
+// per real transition. The target comes from the stateTransitions table under the
+// reconnect flag, so a reconnect-class failure lands in StateReconnecting with
+// reconnect on and StateClosed with it off — the same downgrade the termination
+// tables apply. A trigger with no defined transition from the current state is a
+// no-op and emits nothing.
+func (c *Client) transition(tr trigger) {
 	c.mu.Lock()
 	from := c.state
-	to, ok := lookupStateTransition(from, tr)
+	to, ok := lookupStateTransitionWithReconnect(from, tr, c.cfg.reconnect)
 	if !ok || from == to {
 		c.mu.Unlock()
 		return
@@ -228,7 +488,7 @@ func (c *Client) transition(epochCtx context.Context, tr trigger) {
 	c.state = to
 	c.mu.Unlock()
 
-	c.delivery.send(c.rootCtx, epochCtx, &StateChange{From: from, To: to})
+	c.surface(&StateChange{From: from, To: to})
 }
 
 // terminalSequence is the client's teardown, performed exactly once by whichever
@@ -239,7 +499,7 @@ func (c *Client) terminalSequence() {
 	c.terminalOnce.Do(func() {
 		c.mu.Lock()
 		conn := c.conn
-		cause := c.err
+		cause := c.terminalCause
 		c.mu.Unlock()
 
 		if conn != nil {
@@ -268,6 +528,20 @@ func (c *Client) setErrIfNil(err error) {
 	c.mu.Lock()
 	if c.err == nil {
 		c.err = err
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) setTerminalCause(err error) {
+	c.mu.Lock()
+	c.terminalCause = err
+	c.mu.Unlock()
+}
+
+func (c *Client) setTerminalCauseIfNil(err error) {
+	c.mu.Lock()
+	if c.terminalCause == nil {
+		c.terminalCause = err
 	}
 	c.mu.Unlock()
 }

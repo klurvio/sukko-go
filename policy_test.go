@@ -82,15 +82,28 @@ func TestClosePolicyReconnectDisabled(t *testing.T) {
 	}
 }
 
-// A local 4000 is never emitted: the SDK allocates from the top of the
-// application range, so any observed 4000 is unambiguously the server's
-// force-disconnect. The absence is deliberate and worth pinning — if a local
-// 4000 ever resolved, the direction-based disambiguation would be broken.
-func TestClosePolicyHasNoLocalForceDisconnect(t *testing.T) {
+// Code 4000 is direction-disambiguated exactly as the contract and both sibling
+// SDKs define it: a REMOTE 4000 is the operator force-disconnect (terminal), a
+// LOCAL 4000 is the client's own heartbeat-timeout close (reconnect). Pinning
+// both rows guards the disambiguation — if either collapsed to the other's
+// class, a force-disconnect would be retried or a heartbeat timeout would be
+// fatal.
+func TestClosePolicyDisambiguates4000ByDirection(t *testing.T) {
 	t.Parallel()
 
-	if _, ok := lookupClosePolicy(closeKey{4000, directionLocal, true}); ok {
-		t.Error("closePolicy resolves a local 4000; the SDK must never emit that code")
+	remote, ok := lookupClosePolicy(closeKey{closeCodeForceDisconnect, directionRemote, true})
+	if !ok || remote.class != classTerminal {
+		t.Errorf("remote 4000 = %v (ok=%v), want terminal (operator force-disconnect)", remote.class, ok)
+	}
+
+	local, ok := lookupClosePolicy(closeKey{CloseCodeHeartbeatTimeout, directionLocal, true})
+	if !ok || local.class != classReconnect {
+		t.Errorf("local 4000 = %v (ok=%v), want reconnect (client heartbeat timeout)", local.class, ok)
+	}
+
+	if closeCodeForceDisconnect != CloseCodeHeartbeatTimeout {
+		t.Errorf("the two 4000 meanings must share the code (contract parity): force=%d heartbeat=%d",
+			closeCodeForceDisconnect, CloseCodeHeartbeatTimeout)
 	}
 }
 

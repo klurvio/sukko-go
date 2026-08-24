@@ -54,6 +54,10 @@ type fakeWS struct {
 	// stallUpgrade, when non-nil, holds the handshake until it is closed. It is
 	// what makes a mid-dial cancellation or a dial timeout testable.
 	stallUpgrade chan struct{}
+	// stallFromEpoch, when non-zero, restricts stallUpgrade to epochs at or after
+	// it — so a test can let the first dial succeed and hang only the reconnect
+	// dial, the shape the "dial" timer bounds.
+	stallFromEpoch int
 }
 
 // epochScript describes one connection's behavior.
@@ -153,6 +157,20 @@ func (f *fakeWS) stall() (release func()) {
 	return func() { once.Do(func() { close(ch) }) }
 }
 
+// stallFrom holds handshakes from the given 1-based epoch onward, letting the
+// earlier dials succeed and hanging only a later reconnect dial — the shape the
+// injectable "dial" timer bounds. The returned func releases the stall.
+func (f *fakeWS) stallFrom(epoch int) (release func()) {
+	f.mu.Lock()
+	ch := make(chan struct{})
+	f.stallUpgrade = ch
+	f.stallFromEpoch = epoch
+	f.mu.Unlock()
+
+	var once sync.Once
+	return func() { once.Do(func() { close(ch) }) }
+}
+
 // dialCount reports how many upgrades have been attempted. Reconnect
 // assertions are counts: "exactly one dial" is the positive form of "it did not
 // retry".
@@ -190,6 +208,9 @@ func (f *fakeWS) handle(w http.ResponseWriter, r *http.Request) {
 	headers := make(map[string]string, len(f.upgradeHeaders))
 	maps.Copy(headers, f.upgradeHeaders)
 	stall := f.stallUpgrade
+	if stall != nil && epoch < f.stallFromEpoch {
+		stall = nil // this epoch predates the stall window — serve it normally
+	}
 	script := f.scriptForEpoch(epoch)
 	f.mu.Unlock()
 

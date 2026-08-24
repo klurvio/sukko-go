@@ -89,10 +89,10 @@ func TestDefaultsByValue(t *testing.T) {
 
 	t.Run("close codes", func(t *testing.T) {
 		t.Parallel()
-		// Allocated from the TOP of the 4000-4999 application range because the
-		// platform allocates from the bottom — opposite ends cannot collide.
-		if CloseCodeHeartbeatTimeout != 4999 {
-			t.Errorf("CloseCodeHeartbeatTimeout = %d, want 4999", CloseCodeHeartbeatTimeout)
+		// 4000, direction-disambiguated — the contract's value and both sibling
+		// SDKs' (@sukko/sdk, sukko-py) value for a client heartbeat-timeout close.
+		if CloseCodeHeartbeatTimeout != 4000 {
+			t.Errorf("CloseCodeHeartbeatTimeout = %d, want 4000 (contract + sibling parity)", CloseCodeHeartbeatTimeout)
 		}
 	})
 }
