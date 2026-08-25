@@ -75,9 +75,10 @@ type Client struct {
 	// subReqCh is the bounded subscribe-serializer request queue (SubscribeQueueDepth):
 	// Subscribe/Unsubscribe non-blocking-send here and return; full ⇒ ErrSubscribeQueueFull.
 	subReqCh chan subReq
-	// subPoke tells the serializer to release its outstanding slot (an ack/error
-	// arrived, which the decode loop already reconciled). Buffered(1), non-blocking.
-	subPoke chan struct{}
+	// subPoke tells the serializer to release the flight identified by the sent
+	// generation (an ack/error the decode loop already reconciled). Buffered(1); the
+	// serializer releases only if the gen still matches the current flight.
+	subPoke chan uint64
 	// subFlight is the one outstanding subscribe/unsubscribe: the serializer sets it
 	// before the send and clears it on release; the decode loop reads it to
 	// reconcile an ack in receive order.
@@ -164,7 +165,7 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 		authEscalateCmd: make(chan struct{}, 1),
 		subs:            newSubState(),
 		subReqCh:        make(chan subReq, SubscribeQueueDepth),
-		subPoke:         make(chan struct{}, 1),
+		subPoke:         make(chan uint64, 1),
 		doneCh:          make(chan struct{}),
 		flightMode:      AuthRefresh, // the initial/handshake auth is a refresh; escalation sets it explicitly
 		state:           StateDisconnected,

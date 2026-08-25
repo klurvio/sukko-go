@@ -595,8 +595,8 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		// stale/duplicate ack (or one arriving after a partial-send cleared the flight)
 		// must not release the NEXT flight and roll mis-attribution forward.
 		// Control-plane: hand off, never enqueue.
-		if c.reconcileSubscriptionAck(e.ctx, f.Subscribed, f.Count) {
-			c.pokeSubscribeSerializer()
+		if g, ok := c.reconcileSubscriptionAck(e.ctx, f.Subscribed, f.Count); ok {
+			c.pokeSubscribeSerializer(g)
 		}
 		return
 	case *wireUnsubscriptionAck:
@@ -607,20 +607,22 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		// release the slot; it still surfaces *Unsubscribed below in receive order.
 		// (Pruning the granted set on a forced removal is deferred to the forced/epoch
 		// slice — Subscriptions() may briefly misreport a server-forced channel.)
-		if !f.Forced && c.outstandingIs(reqUnsubscribe) {
-			c.pokeSubscribeSerializer()
+		if !f.Forced {
+			if g, ok := c.matchUnsubscriptionAck(f.Unsubscribed); ok {
+				c.pokeSubscribeSerializer(g)
+			}
 		}
 	case *wireSubscribeError:
-		// Release the outstanding subscribe's slot (matched only), then fall through
-		// to surface the *ProtocolError in receive order.
-		if c.outstandingIs(reqSubscribe) {
-			c.pokeSubscribeSerializer()
+		// Release the outstanding subscribe's slot (gen-matched only), then fall
+		// through to surface the *ProtocolError in receive order.
+		if g, ok := c.outstandingGen(reqSubscribe); ok {
+			c.pokeSubscribeSerializer(g)
 		}
 	case *wireUnsubscribeError:
 		// Symmetric with subscribe_error: release the outstanding unsubscribe's slot,
 		// then fall through to surface the *ProtocolError.
-		if c.outstandingIs(reqUnsubscribe) {
-			c.pokeSubscribeSerializer()
+		if g, ok := c.outstandingGen(reqUnsubscribe); ok {
+			c.pokeSubscribeSerializer(g)
 		}
 	}
 

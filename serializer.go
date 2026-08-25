@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sync"
+	"time"
 )
 
 // The subscribe serializer is a supervisor-lifetime single-owner goroutine — the
@@ -51,11 +52,17 @@ type subFlight struct {
 	active   bool
 	kind     subReqKind
 	channels []string
+	// gen bumps on every set, so a flight is uniquely identifiable. The decode loop
+	// stamps a poke with the gen it validated; the serializer releases only if that
+	// gen still matches the current flight — so a stale poke (its flight cleared by
+	// a timeout and a new one sent) is a no-op, not a release of the NEXT flight.
+	gen uint64
 }
 
 func (s *subFlight) set(kind subReqKind, channels []string) {
 	s.mu.Lock()
 	s.active, s.kind, s.channels = true, kind, channels
+	s.gen++
 	s.mu.Unlock()
 }
 
@@ -71,12 +78,13 @@ func (s *subFlight) isActive() bool {
 	return s.active
 }
 
-// snapshot returns whether a request is outstanding, its kind, and its requested
-// channels — read by the decode loop to reconcile an ack.
-func (s *subFlight) snapshot() (active bool, kind subReqKind, channels []string) {
+// snapshot returns whether a request is outstanding, its kind, its requested
+// channels, and its generation — read by the decode loop to reconcile an ack and
+// stamp the release poke.
+func (s *subFlight) snapshot() (active bool, kind subReqKind, channels []string, gen uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.active, s.kind, s.channels
+	return s.active, s.kind, s.channels, s.gen
 }
 
 // subState holds the subscription sets behind a mutex so the caller-facing
@@ -162,14 +170,33 @@ func (s *subState) pendingSnapshot() []string {
 func (c *Client) runSubscribeSerializer(ownerCtx context.Context) {
 	defer c.recoverSubscribeSerializer()
 
-	// process sends a dequeued request's wire frame when connected and records it
-	// as the outstanding flight. A Subscribe records its channels as desired first
-	// (so they are pending even before the ack, and survive to a reconnect resume).
-	// send sets the flight BEFORE the wire send (so a fast ack cannot beat the
-	// decode loop's read of the requested set) and clears it on a failed send.
+	// ackTimer bounds how long the one outstanding request waits for its ack, so a
+	// withheld ack never strands the queue. AckTimeout tracks the CONFIGURED
+	// RecoveryDeadline (read at arm time), not the constant default (FR-001a).
+	var ackTimer Timer
+	var ackC <-chan time.Time
+	disarmAck := func() {
+		if ackTimer != nil {
+			ackTimer.Stop()
+			ackTimer, ackC = nil, nil
+		}
+	}
+	armAck := func() {
+		disarmAck()
+		ackTimer = c.clock.NewTimer(c.cfg.recoveryDeadline, purposeAckTimeout)
+		ackC = ackTimer.C()
+	}
+
+	// send records the flight BEFORE the wire send (so a fast ack cannot beat the
+	// decode loop's read of the requested set), arms the ack timeout on a
+	// successful send, and clears the flight on a failed send. process (below)
+	// records a Subscribe's channels as desired first, so they are pending even
+	// before the ack and survive to a reconnect resume.
 	send := func(conn Conn, kind subReqKind, channels []string) {
 		c.subFlight.set(kind, channels)
-		if !c.sendSubscribeFrame(ownerCtx, conn, subReq{kind: kind, channels: channels}) {
+		if c.sendSubscribeFrame(ownerCtx, conn, subReq{kind: kind, channels: channels}) {
+			armAck()
+		} else {
 			c.subFlight.clear()
 		}
 	}
@@ -209,13 +236,31 @@ func (c *Client) runSubscribeSerializer(ownerCtx context.Context) {
 		}
 		select {
 		case <-ownerCtx.Done():
+			disarmAck()
 			return
 		case req := <-reqCh:
 			process(req)
-		case <-c.subPoke:
+		case g := <-c.subPoke:
 			// The outstanding request was answered (the decode loop reconciled and
-			// emitted in receive order). Release the slot; the next loop iteration
-			// re-enables reqCh and any buffered request is processed.
+			// emitted in receive order). Release the slot and disarm the timeout — but
+			// ONLY if the poke's generation still matches the current flight. A stale
+			// poke (its flight cleared by a timeout, a new one now outstanding) is a
+			// FULL no-op: disarming or clearing on it would strand the new flight.
+			if active, _, _, cur := c.subFlight.snapshot(); active && g == cur {
+				disarmAck()
+				c.subFlight.clear()
+			}
+		case <-ackC:
+			// The outstanding request's ack never arrived within AckTimeout. Surface a
+			// *ProtocolError (via ownerSurface — parks on rootCtx, discards on owner
+			// teardown) and release the slot so the queue is not stranded.
+			ackTimer, ackC = nil, nil
+			_, kind, _, _ := c.subFlight.snapshot()
+			answer := typeSubscriptionAck
+			if kind == reqUnsubscribe {
+				answer = typeUnsubscriptionAck
+			}
+			c.ownerSurface(ownerCtx, &ProtocolError{Type: answer, Message: "timed out waiting for the acknowledgement"})
 			c.subFlight.clear()
 		}
 	}
@@ -227,10 +272,19 @@ func (c *Client) runSubscribeSerializer(ownerCtx context.Context) {
 // reports whether it matched an outstanding subscribe flight — the caller pokes to
 // release the slot ONLY when it did, so a spurious/stale ack (no outstanding
 // subscribe) neither reconciles NOR releases the next flight.
-func (c *Client) reconcileSubscriptionAck(epochCtx context.Context, subscribed []string, count int) (matched bool) {
-	active, kind, requested := c.subFlight.snapshot()
+func (c *Client) reconcileSubscriptionAck(epochCtx context.Context, subscribed []string, count int) (gen uint64, matched bool) {
+	active, kind, requested, g := c.subFlight.snapshot()
 	if !active || kind != reqSubscribe {
-		return false // no outstanding subscribe this ack could answer
+		return 0, false // no outstanding subscribe this ack could answer
+	}
+	// Subset guard (§II, ADR-0013): the contract guarantees a subscription_ack's
+	// `subscribed` is a subset of THIS request's channels. An ack whose subscribed
+	// contains a channel the outstanding request never asked for cannot belong to it
+	// — a late ack for a timed-out flight mis-landing on a same-kind successor — so
+	// drop it rather than fabricate a grant/denial. (It cannot catch a full denial,
+	// empty `subscribed`; that residual ambiguity is the ADR's accepted trade-off.)
+	if !subset(subscribed, requested) {
+		return 0, false
 	}
 	c.subs.grant(subscribed)
 	c.forward(epochCtx, &SubscriptionResult{
@@ -239,16 +293,36 @@ func (c *Client) reconcileSubscriptionAck(epochCtx context.Context, subscribed [
 		NotGranted: difference(requested, subscribed),
 		Count:      count,
 	})
-	return true
+	return g, true
 }
 
-// outstandingIs reports whether a request of the given kind is currently
-// outstanding — used by the decode loop to release the slot ONLY for an answer
-// that matches the in-flight request (so a stale/duplicate answer cannot release
-// the NEXT flight and roll mis-attribution forward).
-func (c *Client) outstandingIs(kind subReqKind) bool {
-	active, k, _ := c.subFlight.snapshot()
-	return active && k == kind
+// outstandingGen returns the current flight's generation if a request of the given
+// kind is outstanding — used by the decode loop to stamp a release poke, so the
+// serializer releases ONLY the flight the answer actually belongs to (a stale or
+// mis-kinded answer cannot release the next flight).
+func (c *Client) outstandingGen(kind subReqKind) (gen uint64, ok bool) {
+	active, k, _, g := c.subFlight.snapshot()
+	if active && k == kind {
+		return g, true
+	}
+	return 0, false
+}
+
+// matchUnsubscriptionAck returns the outstanding unsubscribe's generation if this
+// (non-forced) ack belongs to it — the symmetric subset guard to the subscribe side
+// (ADR-0013): a legit unsubscription_ack's `unsubscribed` is a subset of the
+// channels the flight sent (its granted subset), so an ack naming a channel the
+// flight never unsubscribed is a late ack for a different (timed-out) unsubscribe
+// and must not release this flight.
+func (c *Client) matchUnsubscriptionAck(unsubscribed []string) (gen uint64, ok bool) {
+	active, kind, channels, g := c.subFlight.snapshot()
+	if !active || kind != reqUnsubscribe {
+		return 0, false
+	}
+	if !subset(unsubscribed, channels) {
+		return 0, false
+	}
+	return g, true
 }
 
 // sendSubscribeFrame marshals and sends the wire frame for a request, reporting
@@ -268,13 +342,34 @@ func (c *Client) sendSubscribeFrame(ownerCtx context.Context, conn Conn, req sub
 	return conn.Send(ownerCtx, frame) == nil
 }
 
-// pokeSubscribeSerializer signals the serializer to release its outstanding slot.
-// Non-blocking (buffered 1).
-func (c *Client) pokeSubscribeSerializer() {
+// pokeSubscribeSerializer signals the serializer to release the flight identified
+// by gen. Drain a stale poke (left by a flight the timeout already cleared) before
+// sending, so a legit poke is never dropped behind a stale one — dispatch is the
+// SOLE poke producer (every call site is on the decode goroutine), so there is no
+// producer race, and the serializer (sole consumer) always sees the latest.
+func (c *Client) pokeSubscribeSerializer(gen uint64) {
 	select {
-	case c.subPoke <- struct{}{}:
+	case <-c.subPoke:
 	default:
 	}
+	select {
+	case c.subPoke <- gen:
+	default:
+	}
+}
+
+// subset reports whether every element of a is in b.
+func subset(a, b []string) bool {
+	inB := make(map[string]struct{}, len(b))
+	for _, s := range b {
+		inB[s] = struct{}{}
+	}
+	for _, s := range a {
+		if _, ok := inB[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // recoverSubscribeSerializer routes a serializer panic to a terminal, mirroring

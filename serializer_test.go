@@ -121,6 +121,166 @@ func TestSubscribePartialGrant(t *testing.T) {
 	}
 }
 
+// waitForProtocolError polls the collected events for a *ProtocolError.
+func waitForProtocolError(t *testing.T, ec *eventCollector) *ProtocolError {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		for _, ev := range ec.snapshot() {
+			if pe, ok := ev.(*ProtocolError); ok {
+				return pe
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatal("no *ProtocolError surfaced")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// TestSubscribeAckTimeoutReleasesSlot pins the AckTimeout path: when a subscribe's
+// ack never arrives, after AckTimeout (= the configured RecoveryDeadline) the
+// serializer surfaces a *ProtocolError and releases the slot, so a queued
+// subscribe still reaches the wire (the slot is not stranded).
+func TestSubscribeAckTimeoutReleasesSlot(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{}) // no subscription_ack → the subscribe stays outstanding
+	c, fc := subClient(t, f)
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	if err := c.Subscribe(context.Background(), []string{"t.a"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitForFrameCount(t, f, typeSubscribe, 1)
+
+	// The ack never comes; advance to the AckTimeout.
+	fc.BlockUntilTimer(purposeAckTimeout)
+	fc.Advance(DefaultRecoveryDeadline)
+	if pe := waitForProtocolError(t, ec); pe == nil {
+		t.Fatal("no *ProtocolError for the ack timeout")
+	}
+
+	// The slot was released: a follow-up subscribe reaches the wire.
+	if err := c.Subscribe(context.Background(), []string{"t.b"}); err != nil {
+		t.Fatalf("Subscribe #2: %v", err)
+	}
+	waitForFrameCount(t, f, typeSubscribe, 2)
+
+	// Exactly one *ProtocolError (the timeout), not one per re-check.
+	var n int
+	for _, ev := range ec.snapshot() {
+		if _, ok := ev.(*ProtocolError); ok {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("*ProtocolError count = %d, want 1", n)
+	}
+}
+
+// TestSubscribeAckDisarmsTimeout is the timeout's paired case: an ack that
+// arrives disarms the ack timeout, so advancing past what would have been the
+// deadline surfaces NO *ProtocolError.
+func TestSubscribeAckDisarmsTimeout(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{respond: map[string][]string{
+		typeSubscribe: {`{"type":"subscription_ack","subscribed":["t.a"],"count":1}`},
+	}})
+	c, fc := subClient(t, f)
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	if err := c.Subscribe(context.Background(), []string{"t.a"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitForSubscriptionResult(t, ec) // the ack was processed → the timeout disarmed
+
+	// Advancing past the deadline fires nothing (the timer was disarmed on the ack).
+	fc.Advance(2 * DefaultRecoveryDeadline)
+	time.Sleep(50 * time.Millisecond)
+	for _, ev := range ec.snapshot() {
+		if _, ok := ev.(*ProtocolError); ok {
+			t.Error("a *ProtocolError surfaced after a successful ack (the timeout was not disarmed)")
+		}
+	}
+}
+
+// TestSubscriptionAckSubsetGuard pins the subset guard (ADR-0013): an ack whose
+// `subscribed` contains a channel the outstanding request never asked for cannot
+// belong to it (a late ack mis-landing after a timeout) and is dropped — it grants
+// nothing and surfaces no *SubscriptionResult.
+func TestSubscriptionAckSubsetGuard(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{respond: map[string][]string{
+		// Grants a channel the request never asked for → not a valid answer to it.
+		typeSubscribe: {`{"type":"subscription_ack","subscribed":["t.a","t.unrequested"],"count":1}`},
+	}})
+	c, _ := subClient(t, f)
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	if err := c.Subscribe(context.Background(), []string{"t.a"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitForFrameCount(t, f, typeSubscribe, 1)
+	time.Sleep(50 * time.Millisecond) // let the (rejected) ack be processed
+
+	if got := c.Subscriptions(); len(got) != 0 {
+		t.Errorf("Subscriptions() = %v, want none (an ack with an un-requested channel is dropped)", got)
+	}
+	for _, ev := range ec.snapshot() {
+		if _, ok := ev.(*SubscriptionResult); ok {
+			t.Error("a subset-violating ack surfaced a *SubscriptionResult")
+		}
+	}
+}
+
+// TestUnsubscriptionAckSubsetGuard pins the symmetric guard: a non-forced
+// unsubscription_ack naming a channel the outstanding unsubscribe never sent is a
+// late ack for a different request and must NOT release the slot.
+func TestUnsubscriptionAckSubsetGuard(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{respond: map[string][]string{
+		typeSubscribe:   {`{"type":"subscription_ack","subscribed":["t.a"],"count":1}`},
+		typeUnsubscribe: {`{"type":"unsubscription_ack","unsubscribed":["t.wrong"],"count":0}`}, // not t.a
+	}})
+	c, _ := subClient(t, f)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	if err := c.Subscribe(context.Background(), []string{"t.a"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitForCond(t, "granted t.a", func() bool { return sortedEqual(c.Subscriptions(), []string{"t.a"}) })
+	if err := c.Unsubscribe(context.Background(), []string{"t.a"}); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	waitForFrameCount(t, f, typeUnsubscribe, 1) // wire unsubscribe sent; the ack names the wrong channel
+
+	// The mis-matched ack was rejected → the unsubscribe slot stays held → a
+	// follow-up subscribe does NOT reach the wire.
+	if err := c.Subscribe(context.Background(), []string{"t.b"}); err != nil {
+		t.Fatalf("Subscribe #2: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := len(f.framesOfType(typeSubscribe)); got != 1 {
+		t.Errorf("subscribe frames = %d, want 1 (a mis-matched unsub-ack must not release the slot)", got)
+	}
+}
+
 // waitForCond polls fn until true or the deadline; fails otherwise.
 func waitForCond(t *testing.T, what string, fn func() bool) {
 	t.Helper()
