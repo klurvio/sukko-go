@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -317,48 +318,57 @@ func TestRefreshWantedWhileDisconnectedSendsOnReconnect(t *testing.T) {
 	}
 }
 
-// TestTokenSourceFetchThenSend covers the connected-refresh fetch: a TokenSource
-// client fetches a fresh credential and sends THAT (not the stored dial token) in
-// the auth frame.
+// TestTokenSourceFetchThenSend covers a TokenSource client fetching for BOTH the
+// dial and the connected refresh: the pre-dial fetch (B1) supplies the dial
+// credential, and a distinct later fetch supplies the connected auth frame — so
+// each fetch's fresh token reaches the wire. The post-connect refresh is floored
+// by the pre-dial fetch's RefreshMinInterval, so it sends only after the floor.
 func TestTokenSourceFetchThenSend(t *testing.T) {
 	f := newFakeWS(t)
 	f.script(epochScript{})
-	ts := func(context.Context) (Token, error) { return Token{Value: "fetched-jwt"}, nil }
-	c, _ := authClient(t, f, WithToken("static-jwt"), WithTokenSource(ts))
+	var calls atomic.Int64
+	ts := func(context.Context) (Token, error) {
+		return Token{Value: fmt.Sprintf("fetched-%d", calls.Add(1))}, nil
+	}
+	c, fc := authClient(t, f, WithTokenSource(ts))
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	defer closeClient(t, c)
 
+	// The first fetch supplied the dial credential.
+	if got := f.authAt(1).authorization; got != "Bearer fetched-1" {
+		t.Errorf("dial Authorization = %q, want the pre-dial fetched token", got)
+	}
+
+	// A connected refresh fetches again (a distinct token) and sends THAT — after
+	// the RefreshMinInterval floor the pre-dial fetch established.
 	if err := c.RefreshToken(context.Background()); err != nil {
 		t.Fatalf("RefreshToken: %v", err)
 	}
+	fc.BlockUntilTimer(purposeRefresh)
+	fc.Advance(DefaultRefreshMinInterval)
 	waitForFrameCount(t, f, typeAuth, 1)
-	if raw := f.framesOfType(typeAuth)[0].raw; !strings.Contains(raw, "fetched-jwt") {
-		t.Errorf("auth frame = %s, want it to carry the fetched token", raw)
-	}
-	// The dial used the static token; the refresh used the fetched one.
-	if got := f.authAt(1).authorization; got != "Bearer static-jwt" {
-		t.Errorf("dial Authorization = %q, want the static token", got)
+	if raw := f.framesOfType(typeAuth)[0].raw; !strings.Contains(raw, "fetched-2") {
+		t.Errorf("auth frame = %s, want it to carry the second fetched token", raw)
 	}
 }
 
-// TestTokenSourceFailureSurfacesAndRetries covers a single fetch failure: no auth
-// frame, an in-band *TokenSourceError{Attempt:1}, and a retry armed (not terminal).
+// TestTokenSourceFailureSurfacesAndRetries covers a pre-dial fetch failure (B1):
+// the first dial never goes out, Connect returns the fetch error, an in-band
+// *TokenSourceError{Attempt:1} is surfaced, and the client falls into a
+// reconnect-class backoff — non-terminal, exactly FR-005 line 63.
 func TestTokenSourceFailureSurfacesAndRetries(t *testing.T) {
 	f := newFakeWS(t)
 	f.script(epochScript{})
 	ts := func(context.Context) (Token, error) { return Token{}, errors.New("token endpoint down") }
-	c, _ := authClient(t, f, WithToken("static-jwt"), WithTokenSource(ts), WithRand(newFakeRand()))
+	c, _ := authClient(t, f, WithTokenSource(ts), WithRand(newFakeRand()))
 	ec := collectEvents(c)
-	if err := c.Connect(context.Background()); err != nil {
-		t.Fatalf("Connect: %v", err)
+	if err := c.Connect(context.Background()); err == nil {
+		t.Fatal("Connect = nil, want the pre-dial fetch error")
 	}
 	defer closeClient(t, c)
 
-	if err := c.RefreshToken(context.Background()); err != nil {
-		t.Fatalf("RefreshToken: %v", err)
-	}
 	tse := waitForTokenSourceError(t, ec)
 	if tse.Attempt != 1 {
 		t.Errorf("Attempt = %d, want 1", tse.Attempt)
@@ -369,6 +379,7 @@ func TestTokenSourceFailureSurfacesAndRetries(t *testing.T) {
 	if err := c.Err(); err != nil {
 		t.Errorf("Err() = %v, want nil (one failure is non-terminal)", err)
 	}
+	waitForState(t, c, StateReconnecting)
 }
 
 // TestTokenSourceExhaustionTerminates covers the connected-refresh 5-strike: after
@@ -377,21 +388,32 @@ func TestTokenSourceFailureSurfacesAndRetries(t *testing.T) {
 func TestTokenSourceExhaustionTerminates(t *testing.T) {
 	f := newFakeWS(t)
 	f.script(epochScript{})
-	ts := func(context.Context) (Token, error) { return Token{}, errors.New("token endpoint down") }
-	// Lengthen the heartbeat so the 30s retry-floor advances below don't trip the
-	// 30s heartbeat + pong timeout and force a reconnect mid-exhaustion.
-	c, fc := authClient(t, f, WithToken("static-jwt"), WithTokenSource(ts),
+	// The first fetch (pre-dial) succeeds so the client connects; every fetch after
+	// that fails, so the connected-refresh path — not the non-terminal dial path —
+	// drives to the 5-strike terminal.
+	var calls atomic.Int64
+	ts := func(context.Context) (Token, error) {
+		if calls.Add(1) == 1 {
+			return Token{Value: "dial-jwt"}, nil
+		}
+		return Token{}, errors.New("token endpoint down")
+	}
+	// Lengthen the heartbeat so the retry-floor advances below don't trip the
+	// heartbeat + pong timeout and force a reconnect mid-exhaustion.
+	c, fc := authClient(t, f, WithTokenSource(ts),
 		WithRand(newFakeRand()), WithHeartbeatInterval(time.Hour))
 	ec := collectEvents(c)
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
-	// The RefreshToken fails once; drive the remaining retries to exhaustion.
+	// Kick the first connected refresh, then drive it to exhaustion. The pre-dial
+	// fetch set lastFetchAt, so the first connected fetch is floored too — one
+	// RefreshMinInterval advance per strike.
 	if err := c.RefreshToken(context.Background()); err != nil {
 		t.Fatalf("RefreshToken: %v", err)
 	}
-	for range MaxTokenSourceAttempts - 1 {
+	for range MaxTokenSourceAttempts {
 		fc.BlockUntilTimer(purposeRefresh)
 		fc.Advance(DefaultRefreshMinInterval)
 	}
@@ -433,7 +455,7 @@ func TestTokenSourceNotFetchedWhileDisconnected(t *testing.T) {
 		fetched <- struct{}{}
 		return Token{Value: "fetched"}, nil
 	}
-	c, _ := authClient(t, f, WithToken("static"), WithTokenSource(ts), WithRand(newFakeRand()))
+	c, _ := authClient(t, f, WithTokenSource(ts), WithRand(newFakeRand()))
 	ec := collectEvents(c)
 	_ = c.Connect(context.Background())
 	defer func() {
@@ -444,13 +466,17 @@ func TestTokenSourceNotFetchedWhileDisconnected(t *testing.T) {
 	}()
 
 	waitForState(t, c, StateReconnecting)
+	// Drain the pre-dial fetch that supplied epoch 1's dial credential (B1). The
+	// backoff timer is left un-advanced, so no reconnect dial — and thus no further
+	// pre-dial fetch — can fire during the window below.
+	<-fetched
 	if err := c.RefreshToken(context.Background()); err != nil {
 		t.Fatalf("RefreshToken: %v", err)
 	}
 	select {
 	case <-fetched:
-		t.Fatal("TokenSource invoked while disconnected")
-	case <-time.After(200 * time.Millisecond): // correct: no fetch without a live socket
+		t.Fatal("TokenSource invoked by a disconnected refresh (no live socket)")
+	case <-time.After(200 * time.Millisecond): // correct: the connected path does not fetch without a socket
 	}
 }
 
@@ -461,8 +487,16 @@ func TestTokenSourceNotFetchedWhileDisconnected(t *testing.T) {
 func TestTokenSourcePanicContained(t *testing.T) {
 	f := newFakeWS(t)
 	f.script(epochScript{})
-	ts := func(context.Context) (Token, error) { panic("token source boom") }
-	c, fc := authClient(t, f, WithToken("static"), WithTokenSource(ts),
+	// Succeed on the pre-dial fetch so the client connects; panic on every fetch
+	// after, so the connected-refresh path exhausts on contained panics.
+	var calls atomic.Int64
+	ts := func(context.Context) (Token, error) {
+		if calls.Add(1) == 1 {
+			return Token{Value: "dial-jwt"}, nil
+		}
+		panic("token source boom")
+	}
+	c, fc := authClient(t, f, WithTokenSource(ts),
 		WithRand(newFakeRand()), WithHeartbeatInterval(time.Hour))
 	ec := collectEvents(c)
 	if err := c.Connect(context.Background()); err != nil {
@@ -472,7 +506,7 @@ func TestTokenSourcePanicContained(t *testing.T) {
 	if err := c.RefreshToken(context.Background()); err != nil {
 		t.Fatalf("RefreshToken: %v", err)
 	}
-	for range MaxTokenSourceAttempts - 1 {
+	for range MaxTokenSourceAttempts {
 		fc.BlockUntilTimer(purposeRefresh)
 		fc.Advance(DefaultRefreshMinInterval)
 	}
@@ -495,24 +529,20 @@ func TestTokenSourceExpiryArmsProactiveWithoutAck(t *testing.T) {
 	// The fake clock's base is 2026-01-01 UTC; expire one hour out.
 	expiry := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
 	ts := func(context.Context) (Token, error) { return Token{Value: "tok", Expiry: expiry}, nil }
-	c, fc := authClient(t, f, WithToken("static"), WithTokenSource(ts),
+	c, fc := authClient(t, f, WithTokenSource(ts),
 		WithRand(newFakeRand()), WithHeartbeatInterval(time.Hour))
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	defer closeClient(t, c)
 
-	// Bootstrap the first fetch: it stores Token.Expiry and arms the proactive timer.
-	if err := c.RefreshToken(context.Background()); err != nil {
-		t.Fatalf("RefreshToken: %v", err)
-	}
-	waitForFrameCount(t, f, typeAuth, 1)
-
-	// Advancing to Token.Expiry − RefreshLead fires the proactive schedule and the
-	// SDK refreshes on its own — with no auth_ack ever received.
+	// The pre-dial fetch (B1) stored Token.Expiry and armed the proactive timer at
+	// connect — no auth_ack and no RefreshToken bootstrap. Advancing to
+	// Token.Expiry − RefreshLead fires the schedule and the SDK refreshes on its
+	// own, sending its first auth frame.
 	fc.BlockUntilTimer(purposeRefresh)
 	fc.Advance(expiry.Add(-DefaultRefreshLead).Sub(fc.Now()))
-	waitForFrameCount(t, f, typeAuth, 2)
+	waitForFrameCount(t, f, typeAuth, 1)
 }
 
 // waitForTokenSourceError polls the collected events for a *TokenSourceError.

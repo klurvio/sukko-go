@@ -61,10 +61,16 @@ type terminationOutcome struct {
 func (c *Client) run(connectCtx context.Context) {
 	// The auth-owner is a supervisor-lifetime goroutine, launched once here and
 	// living across epochs. It MUST be torn down before terminalSequence closes
-	// the transport and Messages(): a terminal failure never cancels rootCtx, so
-	// an owner left running would write a dying socket and — once it emits
-	// *TokenSourceError (next increment) — send on a closed channel and panic.
-	// Stopping it here is correct today and future-proofs that emission.
+	// the transport and Messages(): a SUPERVISOR-side terminal failure never
+	// cancels rootCtx, so an owner left running would write a dying socket and
+	// send *TokenSourceError on a closed channel and panic. Stopping it here (the
+	// exit defer's ownerCancel → ownerWg.Wait) prevents that.
+	//
+	// Single-terminator rule, refined: the owner still never calls terminalSequence
+	// — the exit defer below is the sole terminator. But an owner PANIC is the one
+	// path where the owner cancels rootCtx (recoverAuthOwner records the cause
+	// first, then cancels), which merely TRIGGERS this same exit defer exactly as
+	// Close does; stopTrigger then discriminates the recorded cause into StateError.
 	ownerCtx, ownerCancel := context.WithCancel(c.rootCtx)
 	var ownerWg sync.WaitGroup
 	ownerWg.Go(func() { c.runAuthOwner(ownerCtx) })
@@ -120,7 +126,7 @@ func (c *Client) run(connectCtx context.Context) {
 				delay = computeBackoffDelay(c.cfg.backoff, attempt, c.cfg.rand)
 			}
 			if !c.backoffWait(delay) {
-				c.transition(triggerCloseCalled)
+				c.transition(c.stopTrigger())
 				return
 			}
 			attempt++
@@ -141,7 +147,7 @@ func (c *Client) run(connectCtx context.Context) {
 			// the lifetime context canceled the root is a clean stop, not a
 			// failure.
 			if c.rootCtx.Err() != nil {
-				c.transition(triggerCloseCalled)
+				c.transition(c.stopTrigger())
 				return
 			}
 			out := c.classifyDial(connectCtx, dialErr, wasFirst)
@@ -159,7 +165,7 @@ func (c *Client) run(connectCtx context.Context) {
 		// spurious →connected the caller would see after Close. terminalSequence
 		// closes the stashed conn.
 		if c.rootCtx.Err() != nil {
-			c.transition(triggerCloseCalled)
+			c.transition(c.stopTrigger())
 			return
 		}
 		attempt = 0
@@ -184,7 +190,7 @@ func (c *Client) run(connectCtx context.Context) {
 		// stop wins. Otherwise a Close could surface a post-Close reconnect event,
 		// or deliver a non-nil *Terminal.Err for a clean stop under WithReconnect(false).
 		if rootStopped || c.rootCtx.Err() != nil {
-			c.transition(triggerCloseCalled)
+			c.transition(c.stopTrigger())
 			return
 		}
 		if c.applyOutcome(out) {
@@ -197,7 +203,26 @@ func (c *Client) run(connectCtx context.Context) {
 
 // acquireConn performs a dial: the first one bounded by the caller's connect
 // deadline, every reconnect bounded by the injectable "dial" timer.
+//
+//nolint:contextcheck // a reconnect's pre-dial ensure-token waits on the client-lifetime context (rootCtx), not connectCtx — connectCtx bounds only the FIRST dial, exactly as dial()/reconnectDial() already split. The first-dial branch does wait on connectCtx.
 func (c *Client) acquireConn(connectCtx context.Context, first bool) (Conn, error) {
+	// A TokenSource client fetches a fresh credential before EVERY dial (B1): the
+	// owner is the sole TokenSource caller, so the supervisor requests it over a
+	// reply chan and the fetched token reaches the handshake via the store the
+	// transport reads per dial. A fetch failure becomes the dial error, which
+	// classifyDial's non-HandshakeError fallthrough makes reconnect-class —
+	// non-terminal forever (FR-005 line 63), never a doomed handshake. Static
+	// clients keep the untouched store-read path.
+	if c.cfg.tokenSource != nil {
+		waitCtx := c.rootCtx
+		if first {
+			waitCtx = connectCtx // the first dial is also bounded by Connect(ctx)
+		}
+		if err := c.ensureDialToken(waitCtx); err != nil {
+			return nil, c.redactor.redactError(err)
+		}
+	}
+
 	var conn Conn
 	var err error
 	if first {
@@ -211,6 +236,32 @@ func (c *Client) acquireConn(connectCtx context.Context, first bool) (Conn, erro
 	// leaves a non-credential error (e.g. *HandshakeError) untouched so errors.As
 	// still matches.
 	return conn, c.redactor.redactError(err)
+}
+
+// ensureDialToken asks the auth-owner to fetch a fresh credential and store it
+// before a dial (B1, TokenSource clients only). It rendezvouses with the owner
+// and waits for the reply, escaping on waitCtx (the connect deadline for the
+// first dial) and rootCtx (a Close mid-fetch, which the caller discriminates as a
+// clean stop). A fetch failure is returned so the dial path classifies it
+// reconnect-class; a context escape is wrapped per §III and keys classifyDial's
+// dial-abort branch (which tests connectCtx.Err(), not the error value).
+func (c *Client) ensureDialToken(waitCtx context.Context) error {
+	reply := make(chan error, 1)
+	select {
+	case c.authDialCred <- authDialReq{reply: reply}:
+	case <-waitCtx.Done():
+		return fmt.Errorf("sukko: ensure dial token: %w", waitCtx.Err())
+	case <-c.rootCtx.Done():
+		return fmt.Errorf("sukko: ensure dial token: %w", c.rootCtx.Err())
+	}
+	select {
+	case err := <-reply:
+		return err
+	case <-waitCtx.Done():
+		return fmt.Errorf("sukko: ensure dial token: %w", waitCtx.Err())
+	case <-c.rootCtx.Done():
+		return fmt.Errorf("sukko: ensure dial token: %w", c.rootCtx.Err())
+	}
 }
 
 // dial performs the first dial, bounded by the connect deadline AND the client
@@ -447,6 +498,25 @@ func (c *Client) classifyClose(ce *CloseError) terminationOutcome {
 	default: // classTerminal
 		return terminationOutcome{class: classTerminal, cause: ce, surface: surface, trigger: triggerTerminalFailure}
 	}
+}
+
+// stopTrigger picks the state-machine trigger for a supervisor exit that saw the
+// root context canceled. A canceled root with a failure cause already recorded
+// (c.err != nil) means a failure initiated the teardown — today an auth-owner
+// panic, which records its *InternalError and cancels root (helpers record, the
+// supervisor emits) — so the client lands in StateError. A canceled root with no
+// cause is a genuine Close or lifetime cancel: StateClosed. Close never sets
+// c.err, and the WithReconnect(false) downgrade sets only terminalCause via
+// applyOutcome (which never reaches these root-canceled branches), so the
+// discriminator is unambiguous.
+func (c *Client) stopTrigger() trigger {
+	c.mu.Lock()
+	failed := c.err != nil
+	c.mu.Unlock()
+	if failed {
+		return triggerTerminalFailure
+	}
+	return triggerCloseCalled
 }
 
 // triggerForClass maps a termination class to its state-machine trigger. The

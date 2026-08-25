@@ -57,6 +57,12 @@ type Client struct {
 	// during backoff and could not send). Buffered(1), sent non-blocking by the
 	// supervisor after each handshake.
 	authEpochUp chan struct{}
+	// authDialCred carries a supervisor pre-dial ensure-token request to the
+	// auth-owner (B1): a TokenSource client must fetch a fresh credential before
+	// every dial, and the owner is the sole TokenSource caller. Unbuffered — a
+	// request-reply rendezvous, not a fire-and-forget signal — and the supervisor
+	// only ever has one outstanding, so the send never queues.
+	authDialCred chan authDialReq
 	// doneCh is closed by terminalSequence when teardown is complete.
 	doneCh chan struct{}
 	// terminalOnce guards the whole terminal sequence: it runs once whether the
@@ -130,6 +136,7 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 		authPoke:       make(chan struct{}, 1),
 		authEpochReset: make(chan struct{}, 1),
 		authEpochUp:    make(chan struct{}, 1),
+		authDialCred:   make(chan authDialReq),
 		doneCh:         make(chan struct{}),
 		state:          StateDisconnected,
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -56,6 +57,13 @@ func (b *authInbox) drain() (hasAck bool, ackExp int64, hasError bool) {
 	hasAck, ackExp, hasError = b.hasAck, b.ackExp, b.hasError
 	b.hasAck, b.hasError = false, false
 	return hasAck, ackExp, hasError
+}
+
+// authDialReq is a supervisor→owner request for a pre-dial credential fetch (B1).
+// reply is buffered(1) so the owner never blocks answering even if the supervisor
+// abandoned the wait on a root/connect-context cancellation.
+type authDialReq struct {
+	reply chan error
 }
 
 // credentialStore holds the live credential — the JWT and/or API key — behind a
@@ -243,6 +251,55 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		}
 	}
 
+	// dialFetch answers a supervisor pre-dial ensure-token request (B1). It runs
+	// ONLY here in the owner goroutine, so it shares the same tokenFailCount /
+	// lastFetchAt / ownerExpiry state as the connected refresh with no lock — the
+	// reason the fetch is a reply-chan request and not a direct supervisor call
+	// (ADR-0009, T107). Unlike the connected path it is NON-TERMINAL: a failure,
+	// even the 5th-or-later consecutive, is returned as the dial error and flows
+	// through classifyDial's non-HandshakeError fallthrough to a reconnect-class
+	// backoff — exactly FR-005 line 63, "never manufacture a terminal state" on
+	// the reconnect path. It does NOT gate on the RefreshMinInterval floor: the
+	// supervisor's backoff already paces reconnect dials and the first dial must
+	// fetch immediately. It only RECORDS lastFetchAt so a post-connect refresh
+	// floors correctly.
+	dialFetch := func() error {
+		lastFetchAt = c.clock.Now()
+		tok, err := c.fetchToken(ownerCtx)
+		if err != nil {
+			if ownerCtx.Err() != nil {
+				return err // a fetch aborted by owner shutdown is not a counted failure
+			}
+			tokenFailCount++
+			attempt := tokenFailCount
+			// Emit BEFORE replying so *TokenSourceError lands ahead of the
+			// StateChange→reconnecting the classified dial error will cause. No
+			// terminateTokenSourceExhausted here — the dial path is non-terminal.
+			c.ownerSurface(ownerCtx, &TokenSourceError{Attempt: attempt, Cause: err})
+			return err
+		}
+		// Reset on ANY success (either context), matching FR-005's "a credential it
+		// knows is dead" framing and the connected path: a successful dial fetch
+		// clears the strikes, so ADR-0009's "sit at Max across a reconnect then
+		// terminate on the next connected failure" is unreachable by construction —
+		// the successful fetch that enabled the reconnect already reset the counter.
+		tokenFailCount = 0
+		// UpdateToken/Escalate precedence (spec line 186, ADR-0009 Consequences): a
+		// caller-set credential should win for the next auth via an override-pending
+		// flag. That flag lands with Escalate; until then a pre-dial fetch for a
+		// TokenSource client unconditionally overwrites an UpdateToken-set token
+		// here. Deferred, not silently dropped.
+		c.creds.setToken(tok.Value)
+		if !tok.Expiry.IsZero() {
+			// Token.Expiry arms the proactive schedule now, without waiting for an
+			// auth_ack the handshake never sends — a TokenSource client's dial has no
+			// other initial schedule.
+			ownerExpiry = tok.Expiry
+			armProactive()
+		}
+		return nil
+	}
+
 	for {
 		select {
 		case <-ownerCtx.Done():
@@ -282,6 +339,12 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			// A new epoch is connected: retry a refresh wanted while disconnected
 			// (e.g. the proactive timer fired during backoff and could not send).
 			advance()
+		case req := <-c.authDialCred:
+			// A supervisor pre-dial ensure-token request (B1). Between epochs the
+			// conn is nil, so no connected refresh is in flight to race; the owner is
+			// the sole TokenSource caller. Reply on the buffered chan so this never
+			// blocks even if the supervisor abandoned the wait on a cancel.
+			req.reply <- dialFetch()
 		case <-refreshC:
 			// The proactive/reactive schedule fired: time to refresh.
 			pending = true
@@ -417,14 +480,31 @@ func (c *Client) upAuthOwner() {
 	}
 }
 
-// recoverAuthOwner is the auth-owner's first defer (§V/§VII: no bare recover).
-// The owner-panic → terminal routing lands with the refresh logic that can
-// actually panic (TokenSource, frame sends); until then the owner only waits, so
-// a recovered panic is logged and the goroutine exits.
+// recoverAuthOwner is the auth-owner's first defer (§V/§VII: no bare recover). A
+// panic on this goroutine — from a frame send, a timer arm, or a delivery send
+// that runs inline here — leaves the credential/refresh subsystem dead. Since B1
+// the supervisor's pre-dial ensure-token depends on the owner being alive, so a
+// silently-dead owner would wedge every future dial in StateReconnecting forever.
+// Route the panic to a terminal: record the cause, then cancel the client
+// lifetime. The owner never calls terminalSequence itself (single-terminator
+// rule); canceling root unblocks the supervisor's CURRENT wait — the ensure-token
+// rendezvous, a backoff, a dial, or an epoch read — exactly as Close does, and the
+// supervisor's exit runs terminalSequence with the cause already set, so *Terminal
+// and Err() carry the *InternalError rather than a false clean stop.
 func (c *Client) recoverAuthOwner() {
-	if r := recover(); r != nil {
-		c.cfg.logger.Error("sukko: auth-owner panic", "value", fmt.Sprint(r))
+	r := recover()
+	if r == nil {
+		return
 	}
+	ie := &InternalError{
+		Op:    "auth-owner",
+		Value: fmt.Sprint(r),
+		Stack: string(debug.Stack()),
+	}
+	c.cfg.logger.Error("sukko: auth-owner panic", "value", fmt.Sprint(r))
+	c.setErrIfNil(ie)
+	c.setTerminalCauseIfNil(ie)
+	c.rootCancel()
 }
 
 // authQueryURL returns base with the credential appended as query parameters —
