@@ -276,11 +276,12 @@ func TestRefreshArmsReactivelyFromAuthError(t *testing.T) {
 	}
 }
 
-// TestRefreshWantedWhileDisconnectedSendsOnReconnect pins finding 1's fix: a
-// refresh wanted while there is no live socket (here a RefreshToken during
-// backoff; in production a proactive timer firing in the reconnect gap) is not
-// lost — the epoch-up signal retries it once the new connection is up.
-func TestRefreshWantedWhileDisconnectedSendsOnReconnect(t *testing.T) {
+// TestRefreshTokenWhileReconnectingReturnsNotConnected pins the aligned contract
+// (ADR-0011): RefreshToken is an imperative "send auth now" — while there is no
+// live socket it returns *NotConnectedError and sends nothing, rather than
+// queuing a redundant send (the reconnect's dial re-authenticates). The offline
+// path is UpdateToken + reconnect.
+func TestRefreshTokenWhileReconnectingReturnsNotConnected(t *testing.T) {
 	f := newFakeWS(t)
 	f.script(
 		epochScript{closeAfter: 1011}, // epoch 1 closes immediately (reconnect-class)
@@ -301,20 +302,89 @@ func TestRefreshWantedWhileDisconnectedSendsOnReconnect(t *testing.T) {
 		ec.waitClosed(t)
 	}()
 
-	// Epoch 1 dropped; the client is reconnecting. A refresh now cannot send
-	// (no live socket) and must be remembered, not dropped.
 	waitForState(t, c, StateReconnecting)
-	if err := c.RefreshToken(context.Background()); err != nil {
-		t.Fatalf("RefreshToken: %v", err)
+	err = c.RefreshToken(context.Background())
+	var nce *NotConnectedError
+	if !errors.As(err, &nce) {
+		t.Fatalf("RefreshToken while reconnecting = %v, want *NotConnectedError", err)
+	}
+	if nce.Op != "RefreshToken" {
+		t.Errorf("NotConnectedError.Op = %q, want RefreshToken", nce.Op)
 	}
 
-	// Reconnect: the epoch-up signal retries the wanted refresh on epoch 2.
+	// Reconnect: no queued refresh is retried — epoch 2 carries no auth frame.
 	fc.BlockUntilTimer(purposeBackoff)
 	fc.Advance(DefaultBackoff.Initial)
 	waitForDialCount(t, f, 2)
+	waitForState(t, c, StateConnected)
+	if got := len(f.framesOfType(typeAuth)); got != 0 {
+		t.Errorf("auth frames = %d, want 0 (a disconnected refresh is not queued)", got)
+	}
+}
+
+// TestProactiveRefreshDuringBackoffRetriesOnReconnect covers authEpochUp: a
+// PROACTIVE refresh whose timer fires during a reconnect backoff cannot send (no
+// live socket) but is not lost — the epoch-up signal retries it on the next
+// connection, keeping the refresh schedule alive across the drop. (This is the
+// mechanism the old caller-RefreshToken-while-disconnected test used to exercise,
+// now driven by its real trigger.)
+func TestProactiveRefreshDuringBackoffRetriesOnReconnect(t *testing.T) {
+	fc := newFakeClock()
+	// exp 51s out with a 1s lead → the proactive timer is armed for 50s; a large
+	// backoff (30s) keeps the reconnect from beating it.
+	exp := fc.Now().Add(51 * time.Second).Unix()
+	ack := fmt.Sprintf(`{"type":"auth_ack","data":{"exp":%d}}`, exp)
+	f := newFakeWS(t)
+	f.script(
+		epochScript{respond: map[string][]string{typeAuth: {ack}}}, // epoch 1: acks the refresh, then we drop it via heartbeat
+		epochScript{}, // epoch 2 is healthy
+	)
+	c, err := NewClient(context.Background(), f.URL(),
+		WithHTTPClient(f.client()), WithClock(fc), WithRand(newFakeRand()), WithToken("jwt-1"),
+		WithRefreshLead(time.Second),
+		WithBackoff(BackoffConfig{Initial: 30 * time.Second, Max: 30 * time.Second, Multiplier: 2}))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ec := collectEvents(c)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+		ec.waitClosed(t)
+	}()
+
+	// Arm the proactive schedule on a stable epoch: a connected refresh gets an
+	// auth_ack{exp}, so the owner arms the proactive timer at exp − lead (50s).
+	if err := c.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
 	waitForFrameCount(t, f, typeAuth, 1)
-	if got := f.framesOfType(typeAuth)[0].epoch; got != 2 {
-		t.Errorf("auth frame on epoch %d, want 2 (retried on reconnect)", got)
+	fc.BlockUntilTimer(purposeRefresh)
+
+	// Drop epoch 1 via heartbeat timeout (30s + 10s = 40s), before the proactive
+	// timer (50s) would fire.
+	fc.BlockUntilTimer(purposeHeartbeat)
+	fc.Advance(DefaultHeartbeatInterval)
+	fc.BlockUntilTimer(purposePong)
+	fc.Advance(DefaultPongTimeout)
+	waitForState(t, c, StateReconnecting)
+
+	// Fire the proactive timer DURING the backoff: it cannot send (no socket) and
+	// is remembered.
+	fc.BlockUntilTimer(purposeRefresh)
+	fc.Advance(10 * time.Second) // now 50s: proactive fires, backoff (70s) does not
+
+	// Reconnect: the epoch-up signal retries the remembered proactive refresh.
+	fc.BlockUntilTimer(purposeBackoff)
+	fc.Advance(30 * time.Second) // now 70s: backoff fires
+	waitForDialCount(t, f, 2)
+	waitForFrameCount(t, f, typeAuth, 2)
+	if got := f.framesOfType(typeAuth)[1].epoch; got != 2 {
+		t.Errorf("second auth frame on epoch %d, want 2 (proactive retried on reconnect)", got)
 	}
 }
 
@@ -470,8 +540,11 @@ func TestTokenSourceNotFetchedWhileDisconnected(t *testing.T) {
 	// backoff timer is left un-advanced, so no reconnect dial — and thus no further
 	// pre-dial fetch — can fire during the window below.
 	<-fetched
-	if err := c.RefreshToken(context.Background()); err != nil {
-		t.Fatalf("RefreshToken: %v", err)
+	// A disconnected RefreshToken now returns *NotConnectedError and never reaches
+	// the owner (ADR-0011), so it cannot trigger a TokenSource fetch.
+	var nce *NotConnectedError
+	if err := c.RefreshToken(context.Background()); !errors.As(err, &nce) {
+		t.Fatalf("RefreshToken while disconnected = %v, want *NotConnectedError", err)
 	}
 	select {
 	case <-fetched:

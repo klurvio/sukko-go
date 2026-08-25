@@ -299,19 +299,26 @@ func (c *Client) Iter(ctx context.Context) iter.Seq[Event] {
 }
 
 // RefreshToken triggers an immediate credential refresh: the SDK sends an `auth`
-// frame with the current JWT on the live connection. It is fire-and-forget
-// (FR-001b) and single-flight — concurrent calls coalesce into one in-flight
-// refresh — and a no-op while disconnected, since a reconnect re-authenticates via
-// the dial credential. It returns ErrClosed once the client is closed.
+// frame with the current JWT on the live connection. It is an imperative "send
+// now" method — it REQUIRES a live socket and returns *NotConnectedError in any
+// other state (ADR-0011), because queuing a send for the reconnect would be
+// redundant: the reconnect's dial re-authenticates via the per-dial credential
+// read. The offline path is UpdateToken (store) + reconnect. On a live socket it
+// is fire-and-forget (FR-001b) and single-flight — concurrent calls coalesce into
+// one in-flight refresh. It returns ErrClosed once the client is closed.
 func (c *Client) RefreshToken(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("sukko: refresh token: %w", err)
 	}
 	c.mu.Lock()
-	closed := c.closed || c.state == StateClosed || c.state == StateError
+	state := c.state
+	closed := c.closed
 	c.mu.Unlock()
-	if closed {
+	switch {
+	case closed || state == StateClosed || state == StateError:
 		return ErrClosed
+	case state != StateConnected:
+		return &NotConnectedError{Op: "RefreshToken"}
 	}
 	select {
 	case c.authRefreshCmd <- struct{}{}:
