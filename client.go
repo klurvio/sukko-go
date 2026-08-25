@@ -207,12 +207,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	case err := <-c.firstDial:
 		return err
 	case <-c.doneCh:
-		// The supervisor exited. If Close (or a lifetime cancel) raced the first
-		// dial, BOTH firstDial and doneCh are ready and a bare select would pick
-		// at random — returning Err() (nil on a clean stop) would report a false
-		// success on an already-closed client. The first dial's outcome is always
-		// sent before doneCh closes, so prefer it; fall back to Err() only when no
-		// outcome was reported (a panic before the firstDial send).
+		// The supervisor exited. If a first-dial outcome was reported before the
+		// exit, prefer it (a bare select could pick doneCh and return Err() — nil on
+		// a clean stop — reporting a false success on an already-closed client). Fall
+		// back to Err() when no outcome was sent: a first-dial success that Close
+		// raced (the success path reports only after the →connected transition, which
+		// this exit preempted) or a panic before any report — Err() carries the clean
+		// stop's nil or the failure's cause.
 		select {
 		case err := <-c.firstDial:
 			return err
@@ -367,7 +368,10 @@ func (c *Client) Escalate(ctx context.Context, jwt string) error {
 	case state != StateConnected:
 		return &NotConnectedError{Op: "Escalate"}
 	}
-	c.escalateBox.put(jwt)
+	// Capture the override generation at call time: a later commit uses it to
+	// resolve UpdateToken-vs-Escalate as latest-caller-wins despite the ack's
+	// round-trip latency.
+	c.escalateBox.put(jwt, c.creds.generation())
 	select {
 	case c.authEscalateCmd <- struct{}{}:
 	default: // a signal is already queued; the box holds the latest JWT

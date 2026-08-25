@@ -66,29 +66,31 @@ type authDialReq struct {
 	reply chan error
 }
 
-// escalateBox holds the latest caller-supplied escalation JWT awaiting send.
-// Escalate (caller goroutine) writes it; the auth-owner drains it on the
-// authEscalateCmd signal. Latest-wins: a second Escalate before the first sends
-// overwrites the JWT, so the owner always escalates with the freshest credential.
+// escalateBox holds the latest caller-supplied escalation JWT awaiting send, with
+// the override generation captured at the Escalate CALL (so the commit can tell
+// whether a fresher UpdateToken intervened). Escalate (caller goroutine) writes it;
+// the auth-owner drains it on the authEscalateCmd signal. Latest-wins: a second
+// Escalate before the first sends overwrites both.
 type escalateBox struct {
 	mu  sync.Mutex
 	jwt string
+	gen uint64
 	has bool
 }
 
-func (b *escalateBox) put(jwt string) {
+func (b *escalateBox) put(jwt string, gen uint64) {
 	b.mu.Lock()
-	b.jwt, b.has = jwt, true
+	b.jwt, b.gen, b.has = jwt, gen, true
 	b.mu.Unlock()
 }
 
-// take returns and clears the pending escalation JWT.
-func (b *escalateBox) take() (jwt string, ok bool) {
+// take returns and clears the pending escalation JWT and its captured generation.
+func (b *escalateBox) take() (jwt string, gen uint64, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	jwt, ok = b.jwt, b.has
-	b.jwt, b.has = "", false
-	return jwt, ok
+	jwt, gen, ok = b.jwt, b.gen, b.has
+	b.jwt, b.gen, b.has = "", 0, false
+	return jwt, gen, ok
 }
 
 // credentialStore holds the live credential — the JWT and/or API key — behind a
@@ -100,6 +102,15 @@ type credentialStore struct {
 	mu     sync.Mutex
 	token  string
 	apiKey string
+	// overridePending marks a CALLER-set JWT (via UpdateToken) that must win the
+	// next auth over a configured TokenSource. The owner peeks it before fetching
+	// and clears it only once the presenting auth is ANSWERED — an auth_ack/
+	// auth_error for a connected refresh, or a completed handshake for a dial — not
+	// merely attempted, so a send/dial failure never loses it to a resumed fetch.
+	// overrideGen bumps on every caller write, so a clear guarded by the peeked
+	// generation cannot discard a fresher UpdateToken that raced the presentation.
+	overridePending bool
+	overrideGen     uint64
 }
 
 func newCredentialStore(token, apiKey string) *credentialStore {
@@ -113,12 +124,74 @@ func (s *credentialStore) snapshot() (token, apiKey string) {
 	return s.token, s.apiKey
 }
 
-// setToken stores a JWT (UpdateToken/Escalate). Storing a non-empty token also
+// setToken stores a CALLER-set JWT (UpdateToken) and marks it override-pending, so
+// it wins the next auth over a TokenSource fetch. Storing a non-empty token also
 // flips the credential class to "has JWT" — an API-key-only client becomes
 // publish-capable — because the class is exactly "a JWT is present".
 func (s *credentialStore) setToken(token string) {
 	s.mu.Lock()
 	s.token = token
+	s.overridePending = true
+	s.overrideGen++
+	s.mu.Unlock()
+}
+
+// setTokenFromSource stores a JWT resolved by a TokenSource fetch WITHOUT claiming
+// override precedence, so a TokenSource resumes normally afterward. It no-ops when
+// a caller override is pending: a concurrent UpdateToken that raced an in-flight
+// fetch wins, and its credential is not clobbered by the fetch's result.
+func (s *credentialStore) setTokenFromSource(token string) {
+	s.mu.Lock()
+	if !s.overridePending {
+		s.token = token
+	}
+	s.mu.Unlock()
+}
+
+// generation returns the current override generation, for a caller to capture at
+// the moment it acts (e.g. Escalate) so a later commit can tell whether a fresher
+// UpdateToken has intervened.
+func (s *credentialStore) generation() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.overrideGen
+}
+
+// commitEscalationIfGen stores a successfully-acked escalation JWT and clears any
+// pending override — but ONLY if no caller write has bumped the generation since
+// the escalation was requested (gen captured at Escalate call time). This makes
+// the two caller actions latest-wins even though the ack lands a round-trip later:
+// UpdateToken-then-Escalate commits (the escalation is newer, and a static client's
+// pre-existing stale flag is cleared here — the F1 fix); Escalate-then-UpdateToken
+// no-ops (the UpdateToken is newer, and its credential + override survive). A
+// TokenSource resumes after a committed escalation.
+func (s *credentialStore) commitEscalationIfGen(token string, gen uint64) {
+	s.mu.Lock()
+	if s.overrideGen == gen {
+		s.token = token
+		s.overridePending = false
+	}
+	s.mu.Unlock()
+}
+
+// peekOverride reports the stored token, whether a caller override is pending, and
+// its generation — WITHOUT consuming it. The owner's fetch paths present the token
+// and skip the fetch on override, then clear it via clearOverrideIfGen only once
+// the token is successfully presented.
+func (s *credentialStore) peekOverride() (token string, override bool, gen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token, s.overridePending, s.overrideGen
+}
+
+// clearOverrideIfGen clears the pending override only if no newer caller write has
+// bumped the generation since it was peeked — so a presentation success consumes
+// exactly the override it presented, never a fresher UpdateToken that raced it.
+func (s *credentialStore) clearOverrideIfGen(gen uint64) {
+	s.mu.Lock()
+	if s.overrideGen == gen {
+		s.overridePending = false
+	}
 	s.mu.Unlock()
 }
 
@@ -151,7 +224,11 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		inFlight, pending bool
 		pendingEscalation bool      // an Escalate is wanted but not yet sent
 		escalationJWT     string    // the JWT a pending escalation will send
+		escalationGen     uint64    // the override generation captured at that Escalate call
 		inFlightJWT       string    // the JWT of an in-flight escalation; non-empty ⇒ the flight is an escalation, committed to the store only on its ack
+		inFlightJWTGen    uint64    // the captured generation of the in-flight escalation
+		flightOverride    bool      // the in-flight REFRESH presented a caller override, awaiting its answer to consume it
+		flightOverrideGen uint64    // the generation of that presented override
 		exp               int64     // last auth_ack expiry (unix seconds; 0 = never/unknown)
 		ownerExpiry       time.Time // last Token.Expiry from a fetch (zero = unknown)
 		lastAuthSent      time.Time // for the RefreshMinInterval floor
@@ -159,6 +236,8 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		refreshC          <-chan time.Time
 		tokenFailCount    int       // consecutive TokenSource fetch failures; reset on any success
 		lastFetchAt       time.Time // last TokenSource fetch attempt, for fetch pacing
+		dialOverride      bool      // the last pre-dial fetch presented a caller override, awaiting handshake success to consume it
+		dialOverrideGen   uint64    // the generation of that override, for the gen-guarded clear
 	)
 
 	disarmRefresh := func() {
@@ -238,6 +317,7 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 				pendingEscalation = false
 				pending = false
 				inFlightJWT = escalationJWT
+				inFlightJWTGen = escalationGen
 				lastAuthSent = c.clock.Now()
 			}
 			return
@@ -247,46 +327,60 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		// fresh one (owner-only invocation, bounded by the token_source timer); a
 		// static client reads the stored token.
 		var token string
+		var usedOverride bool
+		var overrideGen uint64
 		if c.cfg.tokenSource != nil {
-			// Pace fetches on the last fetch attempt, not the last successful send:
-			// while fetches fail no auth is sent, so lastAuthSent never advances, and
-			// a RefreshToken burst — the natural reaction to *TokenSourceError — would
-			// hammer the token endpoint straight to the exhaustion terminal.
-			if !lastFetchAt.IsZero() {
-				if wait := lastFetchAt.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()); wait > 0 {
-					armRefresh(wait)
+			if callerTok, override, gen := c.creds.peekOverride(); override {
+				// A caller override (UpdateToken) wins exactly this refresh over a
+				// TokenSource fetch; the TokenSource resumes on the next one. No fetch,
+				// so no fetch-pacing and no expiry arm (the caller supplied none). The
+				// override is cleared only on send SUCCESS below, so a failed send does
+				// not lose the caller's credential to a resumed fetch.
+				tokenFailCount = 0
+				token = callerTok
+				usedOverride = true
+				overrideGen = gen
+			} else {
+				// Pace fetches on the last fetch attempt, not the last successful send:
+				// while fetches fail no auth is sent, so lastAuthSent never advances, and
+				// a RefreshToken burst — the natural reaction to *TokenSourceError — would
+				// hammer the token endpoint straight to the exhaustion terminal.
+				if !lastFetchAt.IsZero() {
+					if wait := lastFetchAt.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()); wait > 0 {
+						armRefresh(wait)
+						return
+					}
+				}
+				lastFetchAt = c.clock.Now()
+				tok, err := c.fetchToken(ownerCtx)
+				if err != nil {
+					if ownerCtx.Err() != nil {
+						return // a fetch aborted by owner shutdown is not a credential failure
+					}
+					tokenFailCount++
+					attempt := tokenFailCount
+					// Record the connected-refresh terminal BEFORE emitting the attempt
+					// error, so a parked emit cannot delay it (the epoch record cancels
+					// the epoch, which drives teardown and unparks the emit). Between
+					// epochs the record no-ops; the retry armed below re-terminates once
+					// connected, so the owner can never wedge at Max with no timer.
+					if attempt >= MaxTokenSourceAttempts {
+						c.terminateTokenSourceExhausted()
+					}
+					c.ownerSurface(ownerCtx, &TokenSourceError{Attempt: attempt, Cause: err})
+					armRefresh(max(computeBackoffDelay(c.cfg.backoff, attempt-1, c.cfg.rand), c.cfg.refreshMinInterval))
 					return
 				}
-			}
-			lastFetchAt = c.clock.Now()
-			tok, err := c.fetchToken(ownerCtx)
-			if err != nil {
-				if ownerCtx.Err() != nil {
-					return // a fetch aborted by owner shutdown is not a credential failure
+				tokenFailCount = 0
+				c.creds.setTokenFromSource(tok.Value)
+				if !tok.Expiry.IsZero() {
+					// A caller-authoritative expiry arms the proactive schedule now,
+					// without waiting for an auth_ack the handshake never sends.
+					ownerExpiry = tok.Expiry
+					armProactive()
 				}
-				tokenFailCount++
-				attempt := tokenFailCount
-				// Record the connected-refresh terminal BEFORE emitting the attempt
-				// error, so a parked emit cannot delay it (the epoch record cancels
-				// the epoch, which drives teardown and unparks the emit). Between
-				// epochs the record no-ops; the retry armed below re-terminates once
-				// connected, so the owner can never wedge at Max with no timer.
-				if attempt >= MaxTokenSourceAttempts {
-					c.terminateTokenSourceExhausted()
-				}
-				c.ownerSurface(ownerCtx, &TokenSourceError{Attempt: attempt, Cause: err})
-				armRefresh(max(computeBackoffDelay(c.cfg.backoff, attempt-1, c.cfg.rand), c.cfg.refreshMinInterval))
-				return
+				token = tok.Value
 			}
-			tokenFailCount = 0
-			c.creds.setToken(tok.Value)
-			if !tok.Expiry.IsZero() {
-				// A caller-authoritative expiry arms the proactive schedule now,
-				// without waiting for an auth_ack the handshake never sends.
-				ownerExpiry = tok.Expiry
-				armProactive()
-			}
-			token = tok.Value
 		} else {
 			token, _ = c.creds.snapshot()
 			if token == "" {
@@ -299,6 +393,14 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			inFlight = true
 			pending = false
 			lastAuthSent = c.clock.Now()
+			if usedOverride {
+				// The override credential was PRESENTED, not yet answered. Record it so
+				// the poke handler consumes it only once the server answers (ack or
+				// auth_error) — a send whose epoch dies unanswered must not consume it,
+				// or the caller's credential is lost with no completed auth.
+				flightOverride = true
+				flightOverrideGen = overrideGen
+			}
 		}
 	}
 
@@ -315,6 +417,19 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 	// fetch immediately. It only RECORDS lastFetchAt so a post-connect refresh
 	// floors correctly.
 	dialFetch := func() error {
+		if _, override, gen := c.creds.peekOverride(); override {
+			// A caller override (UpdateToken) wins this dial over a TokenSource fetch:
+			// the store already holds the caller's credential, so skip the fetch and
+			// let the dial read it via snapshot. This discharges B1's deferred clobber.
+			// The override is NOT consumed here — a dial failure would then lose it to
+			// a resumed fetch — but on the handshake-success signal (authEpochUp).
+			tokenFailCount = 0
+			lastFetchAt = c.clock.Now() // pace the next fetch as if we had fetched now
+			dialOverride = true
+			dialOverrideGen = gen
+			return nil
+		}
+		dialOverride = false
 		lastFetchAt = c.clock.Now()
 		tok, err := c.fetchToken(ownerCtx)
 		if err != nil {
@@ -335,12 +450,10 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		// terminate on the next connected failure" is unreachable by construction —
 		// the successful fetch that enabled the reconnect already reset the counter.
 		tokenFailCount = 0
-		// UpdateToken/Escalate precedence (spec line 186, ADR-0009 Consequences): a
-		// caller-set credential should win for the next auth via an override-pending
-		// flag. That flag lands with Escalate; until then a pre-dial fetch for a
-		// TokenSource client unconditionally overwrites an UpdateToken-set token
-		// here. Deferred, not silently dropped.
-		c.creds.setToken(tok.Value)
+		// A TokenSource-resolved credential is a non-override write: it does not claim
+		// precedence over a later UpdateToken, and it no-ops if a caller override
+		// raced this fetch (that credential wins).
+		c.creds.setTokenFromSource(tok.Value)
 		if !tok.Expiry.IsZero() {
 			// Token.Expiry arms the proactive schedule now, without waiting for an
 			// auth_ack the handshake never sends — a TokenSource client's dial has no
@@ -366,15 +479,25 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			// a live flight and let a second auth go out.
 			if hasAck || hasError {
 				inFlight = false
+				// A refresh that PRESENTED a caller override is now answered (ack =
+				// accepted, auth_error = rejected on the merits): consume the override so
+				// TokenSource resumes, gen-guarded so a newer UpdateToken racing the
+				// answer survives. Consuming at answer-time — not at send — is what keeps
+				// an unanswered epoch death from losing the caller's credential.
+				if flightOverride {
+					c.creds.clearOverrideIfGen(flightOverrideGen)
+					flightOverride = false
+				}
 			}
 			if hasAck {
 				exp = ackExp
 				// At-ack commit: a non-empty inFlightJWT means the answered flight was
-				// an escalation, so commit its JWT to the store on success (flipping the
-				// credential class). A refresh leaves inFlightJWT empty and commits
-				// nothing here (its credential was already the store's or the fetch's).
+				// an escalation, so commit its JWT — gen-guarded at the Escalate CALL, so
+				// a later UpdateToken (whose ack-latency window this spans) is not
+				// clobbered (latest caller wins). A committed escalation clears any stale
+				// override; a refresh leaves inFlightJWT empty and commits nothing here.
 				if inFlightJWT != "" {
-					c.creds.setToken(inFlightJWT)
+					c.creds.commitEscalationIfGen(inFlightJWT, inFlightJWTGen)
 					// Phase-7 DEFERRAL: a successful escalation must re-issue `subscribe`
 					// for the newly-permitted delta (the retained denial subset). No
 					// Subscribe/serializer exists yet, so that delta is structurally empty
@@ -410,28 +533,56 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			// than silently dropped. The refresh SCHEDULE persists (the expiry is
 			// unchanged by a reconnect), so the timer runs on.
 			inFlight = false
+			// A refresh that presented a caller override was never answered → do NOT
+			// consume the override (it survives and is re-presented on the reconnect);
+			// just drop the per-flight tracking flag.
+			flightOverride = false
 			if inFlightJWT != "" && !pendingEscalation {
 				pendingEscalation = true
 				escalationJWT = inFlightJWT
+				escalationGen = inFlightJWTGen
 			}
 			inFlightJWT = ""
 			c.authInbox.drain()
-			advance() // a still-wanted auth: no-ops now (conn cleared), retried on epoch-up
+			advance() // a still-wanted auth: no-ops while conn is nil, retried on epoch-up (or sends here if a fast reconnect already installed a live epoch)
 		case <-c.authEpochUp:
-			// A new epoch is connected: retry a refresh wanted while disconnected
-			// (e.g. the proactive timer fired during backoff and could not send).
+			// A new epoch is connected (handshake success). If the dial presented a
+			// caller override, that credential is now successfully presented — consume
+			// the override so the TokenSource resumes, gen-guarded so a newer
+			// UpdateToken racing the handshake is not lost.
+			if dialOverride {
+				c.creds.clearOverrideIfGen(dialOverrideGen)
+				dialOverride = false
+			}
+			// Retry a refresh wanted while disconnected (e.g. the proactive timer fired
+			// during backoff and could not send).
 			advance()
 		case req := <-c.authDialCred:
 			// A supervisor pre-dial ensure-token request (B1). Between epochs the
 			// conn is nil, so no connected refresh is in flight to race; the owner is
 			// the sole TokenSource caller. Reply on the buffered chan so this never
 			// blocks even if the supervisor abandoned the wait on a cancel.
+			//
+			// Drain a STALE epoch-up from the previous epoch before dialing (F2): the
+			// supervisor is the sole authEpochUp sender and is parked here in the
+			// rendezvous, so any queued epoch-up provably predates this dial and must
+			// not later be mis-attributed to it (which would prematurely consume this
+			// dial's override). Its advance-retry role is safe to drop — conn is nil
+			// now so advance would no-op, and the new handshake sends a fresh epoch-up.
+			// The drain MUST precede the reply, before the supervisor can send a fresh
+			// epoch-up from the new dial's handshake.
+			select {
+			case <-c.authEpochUp:
+			default:
+			}
 			req.reply <- dialFetch()
 		case <-c.authEscalateCmd:
-			// A caller Escalate: take the latest JWT (latest-wins) and try to send it.
-			if jwt, ok := c.escalateBox.take(); ok {
+			// A caller Escalate: take the latest JWT and its captured generation
+			// (latest-wins) and try to send it.
+			if jwt, gen, ok := c.escalateBox.take(); ok {
 				pendingEscalation = true
 				escalationJWT = jwt
+				escalationGen = gen
 			}
 			advance()
 		case <-refreshC:

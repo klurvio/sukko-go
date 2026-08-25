@@ -72,6 +72,25 @@ func TestEscalateWhileDisconnectedReturnsNotConnected(t *testing.T) {
 	}
 }
 
+// TestConnectReturnsConnected pins that Connect returning nil guarantees
+// State()==Connected: an immediate Escalate (or RefreshToken) must not race the
+// →connected transition into a spurious *NotConnectedError.
+func TestConnectReturnsConnected(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(ackEpoch())
+	c, _ := authClient(t, f, WithToken("jwt"))
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+	if got := c.State(); got != StateConnected {
+		t.Errorf("State() = %v immediately after Connect returned nil, want connected", got)
+	}
+	if err := c.Escalate(context.Background(), "jwt2"); err != nil {
+		t.Errorf("Escalate immediately after Connect = %v, want nil", err)
+	}
+}
+
 // TestEscalateEmptyToken rejects an empty JWT with ErrEmptyToken.
 func TestEscalateEmptyToken(t *testing.T) {
 	f := newFakeWS(t)
@@ -300,13 +319,13 @@ func TestEscalateWaitsForInFlightRefresh(t *testing.T) {
 func TestEscalateBoxLatestWins(t *testing.T) {
 	t.Parallel()
 	var b escalateBox
-	b.put("jwt-1")
-	b.put("jwt-2")
-	jwt, ok := b.take()
-	if !ok || jwt != "jwt-2" {
-		t.Errorf("take() = (%q, %v), want (jwt-2, true)", jwt, ok)
+	b.put("jwt-1", 1)
+	b.put("jwt-2", 2)
+	jwt, gen, ok := b.take()
+	if !ok || jwt != "jwt-2" || gen != 2 {
+		t.Errorf("take() = (%q, %d, %v), want (jwt-2, 2, true)", jwt, gen, ok)
 	}
-	if _, ok := b.take(); ok {
+	if _, _, ok := b.take(); ok {
 		t.Error("take() after a take still reports a pending JWT; box was not cleared")
 	}
 }

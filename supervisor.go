@@ -134,15 +134,14 @@ func (c *Client) run(connectCtx context.Context) {
 
 		wasFirst := !firstDialReported
 		conn, dialErr := c.acquireConn(connectCtx, wasFirst)
-		if wasFirst {
-			// Connect returns the first dial's outcome unconditionally (FR-001):
-			// nil on success, the typed error otherwise — and reconnect (when
-			// enabled) still proceeds in the background below.
-			c.firstDial <- dialErr
-			firstDialReported = true
-		}
 
 		if dialErr != nil {
+			if wasFirst {
+				// Connect returns the first dial's failure (FR-001); reconnect (when
+				// enabled) still proceeds in the background below.
+				c.firstDial <- dialErr
+				firstDialReported = true
+			}
 			// Discriminate on cause, not outcome: a dial aborted because Close or
 			// the lifetime context canceled the root is a clean stop, not a
 			// failure.
@@ -163,7 +162,9 @@ func (c *Client) run(connectCtx context.Context) {
 		// Close (or a lifetime cancel) can land exactly as the dial completes.
 		// Discriminate on cause: take the clean-stop exit rather than emit a
 		// spurious →connected the caller would see after Close. terminalSequence
-		// closes the stashed conn.
+		// closes the stashed conn. On this path a first dial reports nothing to
+		// Connect; it unblocks via doneCh (the supervisor exits), returning the
+		// clean-stop nil — never a spurious success.
 		if c.rootCtx.Err() != nil {
 			c.transition(c.stopTrigger())
 			return
@@ -171,6 +172,13 @@ func (c *Client) run(connectCtx context.Context) {
 		attempt = 0
 		override = nil
 		c.transition(triggerHandshakeOK) // connecting/reconnecting → connected
+		if wasFirst {
+			// Report the first dial's SUCCESS only after the state is Connected, so a
+			// caller whose Connect returns nil can immediately RefreshToken/Escalate
+			// without racing the →connected transition (FR-001).
+			c.firstDial <- nil
+			firstDialReported = true
+		}
 		// The connection is live: let the auth-owner retry a refresh it wanted
 		// while disconnected (a proactive timer that fired during backoff).
 		c.upAuthOwner()
