@@ -66,6 +66,31 @@ type authDialReq struct {
 	reply chan error
 }
 
+// escalateBox holds the latest caller-supplied escalation JWT awaiting send.
+// Escalate (caller goroutine) writes it; the auth-owner drains it on the
+// authEscalateCmd signal. Latest-wins: a second Escalate before the first sends
+// overwrites the JWT, so the owner always escalates with the freshest credential.
+type escalateBox struct {
+	mu  sync.Mutex
+	jwt string
+	has bool
+}
+
+func (b *escalateBox) put(jwt string) {
+	b.mu.Lock()
+	b.jwt, b.has = jwt, true
+	b.mu.Unlock()
+}
+
+// take returns and clears the pending escalation JWT.
+func (b *escalateBox) take() (jwt string, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	jwt, ok = b.jwt, b.has
+	b.jwt, b.has = "", false
+	return jwt, ok
+}
+
 // credentialStore holds the live credential — the JWT and/or API key — behind a
 // mutex so the dial path reads the current value (picking up rotation from
 // UpdateToken/Escalate) while callers mutate it. It is the state the
@@ -115,13 +140,18 @@ func (s *credentialStore) setToken(token string) {
 // would wedge inFlight true forever and silently no-op every future RefreshToken;
 // clearing pending too would race a post-reconnect RefreshToken and drop it.
 //
-// (Proactive/reactive refresh arming and TokenSource invocation land on this loop
-// next.)
+// The loop also owns proactive/reactive refresh arming, TokenSource invocation
+// (connected refresh and B1 pre-dial fetch), and escalation: an Escalate is a
+// caller-supplied JWT that takes precedence over a pending refresh, is held in
+// flight, and is committed to the credential store only on its ack.
 func (c *Client) runAuthOwner(ownerCtx context.Context) {
 	defer c.recoverAuthOwner()
 
 	var (
 		inFlight, pending bool
+		pendingEscalation bool      // an Escalate is wanted but not yet sent
+		escalationJWT     string    // the JWT a pending escalation will send
+		inFlightJWT       string    // the JWT of an in-flight escalation; non-empty ⇒ the flight is an escalation, committed to the store only on its ack
 		exp               int64     // last auth_ack expiry (unix seconds; 0 = never/unknown)
 		ownerExpiry       time.Time // last Token.Expiry from a fetch (zero = unknown)
 		lastAuthSent      time.Time // for the RefreshMinInterval floor
@@ -175,7 +205,10 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 		armRefresh(lastAuthSent.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()))
 	}
 	advance := func() {
-		if inFlight || !pending {
+		if inFlight {
+			return
+		}
+		if !pending && !pendingEscalation {
 			return
 		}
 		conn := c.currentConn()
@@ -183,9 +216,9 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			return // no live socket; the epoch-up signal retries on the reconnect
 		}
 		// Honor the RefreshMinInterval floor at SEND time, not only at arm time: a
-		// proactive timer that fired mid-flight, or a caller RefreshToken, must not
-		// bypass the server's 1-per-interval rate limit. The first auth (zero
-		// lastAuthSent) is not floored.
+		// proactive timer that fired mid-flight, or a caller RefreshToken/Escalate,
+		// must not bypass the server's 1-per-interval auth rate limit (which applies
+		// to both modes). The first auth (zero lastAuthSent) is not floored.
 		if !lastAuthSent.IsZero() {
 			if wait := lastAuthSent.Add(c.cfg.refreshMinInterval).Sub(c.clock.Now()); wait > 0 {
 				armRefresh(wait)
@@ -193,9 +226,26 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			}
 		}
 
-		// Obtain the credential to present. A TokenSource client fetches a fresh
-		// one (owner-only invocation, bounded by the token_source timer); a static
-		// client reads the stored token.
+		// Escalation takes precedence over a pending refresh: it carries a fresher,
+		// caller-supplied credential, so a pending refresh is mooted. The JWT is held
+		// in-flight and committed to the store only on its ack — a rejected escalation
+		// must not flip the credential class. setFlightMode before the send so a fast
+		// ack cannot read a stale mode.
+		if pendingEscalation {
+			c.setFlightMode(AuthEscalation)
+			if c.sendAuthFrame(ownerCtx, conn, escalationJWT) {
+				inFlight = true
+				pendingEscalation = false
+				pending = false
+				inFlightJWT = escalationJWT
+				lastAuthSent = c.clock.Now()
+			}
+			return
+		}
+
+		// A refresh. Obtain the credential to present: a TokenSource client fetches a
+		// fresh one (owner-only invocation, bounded by the token_source timer); a
+		// static client reads the stored token.
 		var token string
 		if c.cfg.tokenSource != nil {
 			// Pace fetches on the last fetch attempt, not the last successful send:
@@ -244,6 +294,7 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			}
 		}
 
+		c.setFlightMode(AuthRefresh)
 		if c.sendAuthFrame(ownerCtx, conn, token) {
 			inFlight = true
 			pending = false
@@ -318,9 +369,24 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			}
 			if hasAck {
 				exp = ackExp
+				// At-ack commit: a non-empty inFlightJWT means the answered flight was
+				// an escalation, so commit its JWT to the store on success (flipping the
+				// credential class). A refresh leaves inFlightJWT empty and commits
+				// nothing here (its credential was already the store's or the fetch's).
+				if inFlightJWT != "" {
+					c.creds.setToken(inFlightJWT)
+					// Phase-7 DEFERRAL: a successful escalation must re-issue `subscribe`
+					// for the newly-permitted delta (the retained denial subset). No
+					// Subscribe/serializer exists yet, so that delta is structurally empty
+					// and the re-subscribe is a vacuous no-op — this is omitted, not
+					// stubbed. It lands with the subscribe serializer (spec FR-005;
+					// tests T104/T106/T108 are parked there).
+				}
+				inFlightJWT = ""
 				armProactive()
 			}
 			if hasError {
+				inFlightJWT = "" // a rejected escalation: discard the uncommitted JWT
 				armReactive()
 			}
 			advance()
@@ -328,13 +394,29 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			// The epoch ended before an answer arrived: abandon the outstanding
 			// flight — its answer will never come on the new connection. A refresh
 			// still WANTED (pending) survives and is retried on the reconnect;
-			// clearing it here would race a post-reconnect RefreshToken and drop it.
-			// Drain the inbox so a stale answer from the dead epoch cannot later
-			// clear a fresh flight. The refresh SCHEDULE persists (the expiry is
-			// unchanged by a reconnect), so the timer is left running.
+			// clearing it here would race a post-reconnect caller call and drop it.
+			//
+			// An IN-FLIGHT escalation needs more than a refresh: its JWT is committed
+			// only at-ack (never reaching the store), so unlike a refresh the reconnect
+			// dial does NOT re-present it — it would be silently lost. Restore it as a
+			// wanted escalation so epoch-up re-sends it on the new connection (a server
+			// re-ack of an already-escalated connection is idempotent). Guard on
+			// !pendingEscalation so a NEWER Escalate's JWT (latest-wins) is never
+			// overwritten by this stale in-flight one.
+			//
+			// Drain the inbox so a stale answer from the dead epoch cannot later clear
+			// a fresh flight — and, for an escalation, so a genuine same-epoch ack that
+			// races this reset is superseded by the idempotent re-send above rather
+			// than silently dropped. The refresh SCHEDULE persists (the expiry is
+			// unchanged by a reconnect), so the timer runs on.
 			inFlight = false
+			if inFlightJWT != "" && !pendingEscalation {
+				pendingEscalation = true
+				escalationJWT = inFlightJWT
+			}
+			inFlightJWT = ""
 			c.authInbox.drain()
-			advance() // a still-wanted refresh: no-ops now (conn cleared), retried on epoch-up
+			advance() // a still-wanted auth: no-ops now (conn cleared), retried on epoch-up
 		case <-c.authEpochUp:
 			// A new epoch is connected: retry a refresh wanted while disconnected
 			// (e.g. the proactive timer fired during backoff and could not send).
@@ -345,6 +427,13 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 			// the sole TokenSource caller. Reply on the buffered chan so this never
 			// blocks even if the supervisor abandoned the wait on a cancel.
 			req.reply <- dialFetch()
+		case <-c.authEscalateCmd:
+			// A caller Escalate: take the latest JWT (latest-wins) and try to send it.
+			if jwt, ok := c.escalateBox.take(); ok {
+				pendingEscalation = true
+				escalationJWT = jwt
+			}
+			advance()
 		case <-refreshC:
 			// The proactive/reactive schedule fired: time to refresh.
 			pending = true

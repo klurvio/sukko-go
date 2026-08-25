@@ -560,16 +560,19 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		return
 	}
 
-	// auth_ack and auth_error answer an in-flight refresh: record the answer in the
-	// inbox and poke the auth-owner (it clears its flight and re-arms the refresh
-	// schedule). auth_ack also surfaces *Authenticated in receive order — every
-	// auth is a refresh today; the mode becomes owner state once Escalate lands.
-	// auth_error falls through to surfaceEvent below, forwarding *AuthError.
+	// auth_ack and auth_error answer an in-flight auth (refresh or escalation):
+	// record the answer in the inbox and poke the auth-owner (it clears its flight,
+	// commits an escalation's JWT, and re-arms the schedule). auth_ack also surfaces
+	// *Authenticated in receive order, labeled with the in-flight mode — read BEFORE
+	// poking so a new flight the owner may start on the poke cannot relabel this ack
+	// (the wire carries no mode; it is the SDK's own owned state). auth_error falls
+	// through to surfaceEvent below, forwarding *AuthError.
 	switch f := decoded.(type) {
 	case *wireAuthAck:
+		mode := c.currentFlightMode()
 		c.authInbox.putAck(f.Data.Exp)
 		c.pokeAuthOwner()
-		c.forward(e.ctx, &Authenticated{Exp: f.Data.Exp, Mode: AuthRefresh})
+		c.forward(e.ctx, &Authenticated{Exp: f.Data.Exp, Mode: mode})
 		return
 	case *wireAuthError:
 		c.authInbox.putError()

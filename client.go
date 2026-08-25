@@ -63,6 +63,11 @@ type Client struct {
 	// request-reply rendezvous, not a fire-and-forget signal — and the supervisor
 	// only ever has one outstanding, so the send never queues.
 	authDialCred chan authDialReq
+	// authEscalateCmd signals the auth-owner that an Escalate is wanted; the JWT
+	// itself rides escalateBox (latest-wins). Buffered(1), sent non-blocking.
+	authEscalateCmd chan struct{}
+	// escalateBox holds the latest caller-supplied escalation JWT awaiting send.
+	escalateBox escalateBox
 	// doneCh is closed by terminalSequence when teardown is complete.
 	doneCh chan struct{}
 	// terminalOnce guards the whole terminal sequence: it runs once whether the
@@ -84,8 +89,13 @@ type Client struct {
 	// connected-refresh TokenSource-exhaustion terminal into its first-cause slot
 	// (the owner cannot call terminalSequence itself). nil between epochs.
 	currentEpoch *epoch
-	started      bool // the supervisor was launched (Connect called)
-	closed       bool // Close was called
+	// flightMode is the mode (refresh vs escalation) of the auth frame currently in
+	// flight. The auth-owner writes it when it sends; the decode goroutine reads it
+	// to label *Authenticated (the wire carries no mode). Single-flight keeps it
+	// stable between send and the answering ack.
+	flightMode AuthMode
+	started    bool // the supervisor was launched (Connect called)
+	closed     bool // Close was called
 }
 
 // NewClient builds a client for a URL. It validates the configuration and fails
@@ -121,24 +131,26 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 	}
 
 	c := &Client{
-		cfg:            cfg,
-		clock:          cfg.clock,
-		transport:      newWSTransport(url, cfg, credentials),
-		delivery:       newDelivery(cfg.queueSize, cfg.clock, counters),
-		counters:       counters,
-		creds:          creds,
-		redactor:       redactor,
-		authInbox:      &authInbox{},
-		rootCtx:        rootCtx,
-		rootCancel:     rootCancel,
-		firstDial:      make(chan error, 1),
-		authRefreshCmd: make(chan struct{}, 1),
-		authPoke:       make(chan struct{}, 1),
-		authEpochReset: make(chan struct{}, 1),
-		authEpochUp:    make(chan struct{}, 1),
-		authDialCred:   make(chan authDialReq),
-		doneCh:         make(chan struct{}),
-		state:          StateDisconnected,
+		cfg:             cfg,
+		clock:           cfg.clock,
+		transport:       newWSTransport(url, cfg, credentials),
+		delivery:        newDelivery(cfg.queueSize, cfg.clock, counters),
+		counters:        counters,
+		creds:           creds,
+		redactor:        redactor,
+		authInbox:       &authInbox{},
+		rootCtx:         rootCtx,
+		rootCancel:      rootCancel,
+		firstDial:       make(chan error, 1),
+		authRefreshCmd:  make(chan struct{}, 1),
+		authPoke:        make(chan struct{}, 1),
+		authEpochReset:  make(chan struct{}, 1),
+		authEpochUp:     make(chan struct{}, 1),
+		authDialCred:    make(chan authDialReq),
+		authEscalateCmd: make(chan struct{}, 1),
+		doneCh:          make(chan struct{}),
+		flightMode:      AuthRefresh, // the initial/handshake auth is a refresh; escalation sets it explicitly
+		state:           StateDisconnected,
 	}
 
 	// Canceling the client-lifetime context tears the client down like Close.
@@ -325,6 +337,57 @@ func (c *Client) RefreshToken(ctx context.Context) error {
 	default: // a refresh is already queued; coalesce
 	}
 	return nil
+}
+
+// Escalate widens an API-key connection to full JWT access (or replaces the JWT
+// in escalation mode) by sending an `auth` frame carrying the caller-supplied JWT
+// on the live socket. Like RefreshToken it is an imperative "send now" method: it
+// REQUIRES a live socket and returns *NotConnectedError in any other state — it
+// does not silently store the credential (that is UpdateToken). The offline path
+// is UpdateToken(jwt) + reconnect. An empty JWT is rejected. On a successful ack
+// the JWT is committed to the credential store (flipping the client's class to
+// "has JWT"); a rejected escalation leaves the store unchanged. It is
+// fire-and-forget (FR-001b) and single-flight (latest JWT wins). An escalation
+// accepted on a live socket that then drops before its ack is re-sent on the
+// reconnect rather than lost.
+func (c *Client) Escalate(ctx context.Context, jwt string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("sukko: escalate: %w", err)
+	}
+	if jwt == "" {
+		return ErrEmptyToken
+	}
+	c.mu.Lock()
+	state := c.state
+	closed := c.closed
+	c.mu.Unlock()
+	switch {
+	case closed || state == StateClosed || state == StateError:
+		return ErrClosed
+	case state != StateConnected:
+		return &NotConnectedError{Op: "Escalate"}
+	}
+	c.escalateBox.put(jwt)
+	select {
+	case c.authEscalateCmd <- struct{}{}:
+	default: // a signal is already queued; the box holds the latest JWT
+	}
+	return nil
+}
+
+// setFlightMode records the mode of the auth frame the owner is sending, for the
+// decode goroutine to read when it labels *Authenticated.
+func (c *Client) setFlightMode(m AuthMode) {
+	c.mu.Lock()
+	c.flightMode = m
+	c.mu.Unlock()
+}
+
+// currentFlightMode returns the in-flight auth's mode.
+func (c *Client) currentFlightMode() AuthMode {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flightMode
 }
 
 // UpdateToken stores a JWT for the next connect and the next auth refresh. It is
