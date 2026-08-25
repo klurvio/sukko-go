@@ -74,6 +74,9 @@ func (c *Client) run(connectCtx context.Context) {
 	ownerCtx, ownerCancel := context.WithCancel(c.rootCtx)
 	var ownerWg sync.WaitGroup
 	ownerWg.Go(func() { c.runAuthOwner(ownerCtx) })
+	// The subscribe serializer is the second supervisor-lifetime owner goroutine,
+	// launched and torn down on the same ownerCtx/ownerWg as the auth-owner.
+	ownerWg.Go(func() { c.runSubscribeSerializer(ownerCtx) })
 
 	// One combined exit defer (§VII: recover is effectively first, and the
 	// terminal sequence runs after the cause is set). On a panic the recover
@@ -585,6 +588,40 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 	case *wireAuthError:
 		c.authInbox.putError()
 		c.pokeAuthOwner()
+	case *wireSubscriptionAck:
+		// Reconcile the grant against the serializer's outstanding requested set and
+		// emit *SubscriptionResult HERE, in receive order (like *Authenticated). Poke
+		// to release the slot ONLY if this ack matched the outstanding SUBSCRIBE — a
+		// stale/duplicate ack (or one arriving after a partial-send cleared the flight)
+		// must not release the NEXT flight and roll mis-attribution forward.
+		// Control-plane: hand off, never enqueue.
+		if c.reconcileSubscriptionAck(e.ctx, f.Subscribed, f.Count) {
+			c.pokeSubscribeSerializer()
+		}
+		return
+	case *wireUnsubscriptionAck:
+		// A client-initiated unsubscribe (forced:false) answers the outstanding
+		// unsubscribe — release the slot, but only if an unsubscribe is actually
+		// outstanding (a stale/duplicate ack must not release the next flight). A
+		// forced (unsolicited) ack is not a reply to a client request and must NOT
+		// release the slot; it still surfaces *Unsubscribed below in receive order.
+		// (Pruning the granted set on a forced removal is deferred to the forced/epoch
+		// slice — Subscriptions() may briefly misreport a server-forced channel.)
+		if !f.Forced && c.outstandingIs(reqUnsubscribe) {
+			c.pokeSubscribeSerializer()
+		}
+	case *wireSubscribeError:
+		// Release the outstanding subscribe's slot (matched only), then fall through
+		// to surface the *ProtocolError in receive order.
+		if c.outstandingIs(reqSubscribe) {
+			c.pokeSubscribeSerializer()
+		}
+	case *wireUnsubscribeError:
+		// Symmetric with subscribe_error: release the outstanding unsubscribe's slot,
+		// then fall through to surface the *ProtocolError.
+		if c.outstandingIs(reqUnsubscribe) {
+			c.pokeSubscribeSerializer()
+		}
 	}
 
 	ev, serr := surfaceEvent(decoded)

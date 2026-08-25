@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"slices"
 	"sync"
 )
 
@@ -68,6 +69,19 @@ type Client struct {
 	authEscalateCmd chan struct{}
 	// escalateBox holds the latest caller-supplied escalation JWT awaiting send.
 	escalateBox escalateBox
+	// subs holds the subscription sets (granted/desired), read by the caller-facing
+	// accessors and written by the subscribe serializer (sole writer).
+	subs *subState
+	// subReqCh is the bounded subscribe-serializer request queue (SubscribeQueueDepth):
+	// Subscribe/Unsubscribe non-blocking-send here and return; full ⇒ ErrSubscribeQueueFull.
+	subReqCh chan subReq
+	// subPoke tells the serializer to release its outstanding slot (an ack/error
+	// arrived, which the decode loop already reconciled). Buffered(1), non-blocking.
+	subPoke chan struct{}
+	// subFlight is the one outstanding subscribe/unsubscribe: the serializer sets it
+	// before the send and clears it on release; the decode loop reads it to
+	// reconcile an ack in receive order.
+	subFlight subFlight
 	// doneCh is closed by terminalSequence when teardown is complete.
 	doneCh chan struct{}
 	// terminalOnce guards the whole terminal sequence: it runs once whether the
@@ -148,6 +162,9 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 		authEpochUp:     make(chan struct{}, 1),
 		authDialCred:    make(chan authDialReq),
 		authEscalateCmd: make(chan struct{}, 1),
+		subs:            newSubState(),
+		subReqCh:        make(chan subReq, SubscribeQueueDepth),
+		subPoke:         make(chan struct{}, 1),
 		doneCh:          make(chan struct{}),
 		flightMode:      AuthRefresh, // the initial/handshake auth is a refresh; escalation sets it explicitly
 		state:           StateDisconnected,
@@ -405,6 +422,57 @@ func (c *Client) UpdateToken(token string) error {
 	c.creds.setToken(token)
 	return nil
 }
+
+// Subscribe requests delivery of the given channels. Subscription is STATE, not an
+// action: the request is enqueued on the serializer and Subscribe returns as soon
+// as it is accepted — it is fire-and-forget (FR-001b), never awaits an ack, and is
+// accepted in any non-closed state (a request made while disconnected updates the
+// desired set and is flushed on the next connect). A full serializer queue yields
+// ErrSubscribeQueueFull; a closed client returns ErrClosed. The grant outcome
+// arrives in-band as *SubscriptionResult.
+func (c *Client) Subscribe(ctx context.Context, channels []string) error {
+	return c.enqueueSubReq(ctx, "subscribe", subReq{kind: reqSubscribe, channels: slices.Clone(channels)})
+}
+
+// Unsubscribe abandons the given channels. Like Subscribe it is fire-and-forget
+// and accepted in any non-closed state. It prunes the channels from both the
+// granted and the pending sets; a wire `unsubscribe` is sent only for channels
+// currently granted (a never-granted channel is pruned locally with no wire
+// traffic).
+func (c *Client) Unsubscribe(ctx context.Context, channels []string) error {
+	return c.enqueueSubReq(ctx, "unsubscribe", subReq{kind: reqUnsubscribe, channels: slices.Clone(channels)})
+}
+
+// enqueueSubReq is the shared enqueue path for Subscribe/Unsubscribe.
+func (c *Client) enqueueSubReq(ctx context.Context, op string, req subReq) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("sukko: %s: %w", op, err)
+	}
+	if len(req.channels) == 0 {
+		return nil // nothing to do
+	}
+	c.mu.Lock()
+	closed := c.closed || c.state == StateClosed || c.state == StateError
+	c.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
+	select {
+	case c.subReqCh <- req:
+		return nil
+	default:
+		return ErrSubscribeQueueFull
+	}
+}
+
+// Subscriptions returns the granted set — the channels the client is actually
+// receiving — as full tenant-prefixed strings.
+func (c *Client) Subscriptions() []string { return c.subs.grantedSnapshot() }
+
+// PendingSubscriptions returns the requested-but-not-yet-granted set (FR-001a):
+// channels a Subscribe asked for that are not (yet) granted — covering both a
+// Subscribe issued while disconnected and the post-ack denial delta.
+func (c *Client) PendingSubscriptions() []string { return c.subs.pendingSnapshot() }
 
 // Stats returns an eventually-consistent snapshot of the client's counters.
 func (c *Client) Stats() Stats { return c.counters.snapshot() }

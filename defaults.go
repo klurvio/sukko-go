@@ -19,6 +19,13 @@ const (
 	// knob.
 	DefaultQueueSize = 512
 
+	// SubscribeQueueDepth is the bound on the subscribe serializer's request queue.
+	// Subscribe/Unsubscribe enqueue here and return immediately; a full queue
+	// yields ErrSubscribeQueueFull. The serializer keeps one request outstanding at
+	// a time (the wire's subscription_ack carries no correlation id), so this bounds
+	// how many caller requests may await their turn.
+	SubscribeQueueDepth = 64
+
 	// DefaultHistoryLimit is the default number of records a History call
 	// requests. It tracks the server's WS_HISTORY_MAX_LIMIT *default*.
 	DefaultHistoryLimit = 100
