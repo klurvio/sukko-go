@@ -185,6 +185,10 @@ func (c *Client) run(connectCtx context.Context) {
 		// The connection is live: let the auth-owner retry a refresh it wanted
 		// while disconnected (a proactive timer that fired during backoff).
 		c.upAuthOwner()
+		// Re-subscribe the desired set on the new epoch: the reset cleared granted,
+		// so the resume covers the whole desired set (FR-001a). Sent after upAuthOwner
+		// so auth (if any) leads, though the serializer and auth-owner are independent.
+		c.resumeSubscribeSerializer()
 
 		out, rootStopped := c.runEpoch(conn)
 		// The epoch ended. Clear the live-conn reference so the auth-owner's
@@ -195,6 +199,11 @@ func (c *Client) run(connectCtx context.Context) {
 		// Tell the auth-owner to abandon any refresh outstanding on this now-dead
 		// connection (its answer will never arrive).
 		c.resetAuthOwner()
+		// Tell the serializer the epoch ended: drop the outstanding flight, disarm its
+		// timeout, and clear the granted set. Enqueued here — BEFORE the next dial — so
+		// the reset provably precedes any send on the reconnected epoch (the
+		// drain-before-send discipline in the serializer relies on this ordering).
+		c.resetSubscribeSerializer()
 		// Discriminate on cause, not outcome (as the dial path does): if Close or a
 		// lifetime cancel raced the epoch's end — even if the heartbeat or a panic
 		// won the first-cause slot first, making rootStopped false — the caller's
@@ -605,12 +614,14 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		// outstanding (a stale/duplicate ack must not release the next flight). A
 		// forced (unsolicited) ack is not a reply to a client request and must NOT
 		// release the slot; it still surfaces *Unsubscribed below in receive order.
-		// (Pruning the granted set on a forced removal is deferred to the forced/epoch
-		// slice — Subscriptions() may briefly misreport a server-forced channel.)
-		if !f.Forced {
-			if g, ok := c.matchUnsubscriptionAck(f.Unsubscribed); ok {
-				c.pokeSubscribeSerializer(g)
-			}
+		if f.Forced {
+			// A server-forced removal (e.g. an auth-refresh downgrade): prune the
+			// granted set ONLY, keeping desired — the channel moves to
+			// PendingSubscriptions() so a later escalation delta can re-subscribe it
+			// (events.go). It does not release the slot (it answers no client request).
+			c.subs.pruneGranted(f.Unsubscribed)
+		} else if g, ok := c.matchUnsubscriptionAck(f.Unsubscribed); ok {
+			c.pokeSubscribeSerializer(g)
 		}
 	case *wireSubscribeError:
 		// Release the outstanding subscribe's slot (gen-matched only), then fall

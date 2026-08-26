@@ -79,6 +79,16 @@ type Client struct {
 	// generation (an ack/error the decode loop already reconciled). Buffered(1); the
 	// serializer releases only if the gen still matches the current flight.
 	subPoke chan uint64
+	// subEpochReset tells the serializer an epoch ended, so it drops the outstanding
+	// flight, disarms the ack timeout, and clears the granted set (granted→pending);
+	// desired is untouched, so the resume re-subscribes the whole set. Buffered(1),
+	// mirroring authEpochReset.
+	subEpochReset chan struct{}
+	// subResume tells the serializer to re-subscribe its current pending set. Two
+	// producers coalesce into it — the supervisor on epoch-up (reconnect: granted
+	// cleared → all desired pending) and the auth-owner on an escalation commit
+	// (granted intact → the denied subset). Buffered(1), mirroring authEpochUp.
+	subResume chan struct{}
 	// subFlight is the one outstanding subscribe/unsubscribe: the serializer sets it
 	// before the send and clears it on release; the decode loop reads it to
 	// reconcile an ack in receive order.
@@ -166,6 +176,8 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 		subs:            newSubState(),
 		subReqCh:        make(chan subReq, SubscribeQueueDepth),
 		subPoke:         make(chan uint64, 1),
+		subEpochReset:   make(chan struct{}, 1),
+		subResume:       make(chan struct{}, 1),
 		doneCh:          make(chan struct{}),
 		flightMode:      AuthRefresh, // the initial/handshake auth is a refresh; escalation sets it explicitly
 		state:           StateDisconnected,

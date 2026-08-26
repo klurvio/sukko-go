@@ -498,12 +498,15 @@ func (c *Client) runAuthOwner(ownerCtx context.Context) {
 				// override; a refresh leaves inFlightJWT empty and commits nothing here.
 				if inFlightJWT != "" {
 					c.creds.commitEscalationIfGen(inFlightJWT, inFlightJWTGen)
-					// Phase-7 DEFERRAL: a successful escalation must re-issue `subscribe`
-					// for the newly-permitted delta (the retained denial subset). No
-					// Subscribe/serializer exists yet, so that delta is structurally empty
-					// and the re-subscribe is a vacuous no-op — this is omitted, not
-					// stubbed. It lands with the subscribe serializer (spec FR-005;
-					// tests T104/T106/T108 are parked there).
+					// A successful escalation re-issues `subscribe` for the newly-permitted
+					// delta (the retained denial subset): signal the serializer to
+					// re-subscribe its pending set. Unconditional — even when the
+					// gen-guarded commit above no-ops (a newer UpdateToken raced the ack),
+					// the SERVER acked this escalation, so its permissions changed regardless
+					// of the local store race; the resubscribe tracks server state, not store
+					// state. The serializer recomputes pending (desired − granted) at service
+					// time, so with no retained denials the resume is a vacuous no-op.
+					c.resumeSubscribeSerializer()
 				}
 				inFlightJWT = ""
 				armProactive()

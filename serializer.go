@@ -121,6 +121,29 @@ func (s *subState) grant(channels []string) {
 	s.mu.Unlock()
 }
 
+// resetGrants clears the granted set at an epoch boundary — the server has
+// dropped every subscription with the old connection — while leaving desired
+// untouched, so PendingSubscriptions() becomes the whole desired set until the
+// resume re-grants it. Serializer only.
+func (s *subState) resetGrants() {
+	s.mu.Lock()
+	clear(s.granted)
+	s.mu.Unlock()
+}
+
+// pruneGranted removes channels from the granted set ONLY, leaving desired
+// intact — a server-forced unsubscribe (unsubscription_ack{forced:true}) or an
+// auth-refresh downgrade drops the grant but keeps the caller's intent, so the
+// channel moves back to PendingSubscriptions() and the escalation delta can
+// re-subscribe it (events.go). Decode loop only.
+func (s *subState) pruneGranted(channels []string) {
+	s.mu.Lock()
+	for _, ch := range channels {
+		delete(s.granted, ch)
+	}
+	s.mu.Unlock()
+}
+
 // remove prunes channels from BOTH the desired and granted sets (Unsubscribe's
 // both-set pruning, FR-001a) and returns the subset that was granted — the only
 // channels a wire `unsubscribe` frame need cover. Serializer only.
@@ -187,6 +210,43 @@ func (c *Client) runSubscribeSerializer(ownerCtx context.Context) {
 		ackC = ackTimer.C()
 	}
 
+	// resubscribePending is the single resume flag (goroutine-local, so lock-free):
+	// set on a subResume signal, serviced at idle by subscribing the current pending
+	// set. It covers BOTH reconnect (granted cleared by an epoch reset → all desired
+	// pending) and an escalation commit (granted intact → the denied subset).
+	var resubscribePending bool
+
+	// applyEpochReset is the PURE state reset for an epoch boundary: drop the
+	// outstanding flight, disarm its timeout, and clear the granted set (granted→
+	// pending). No stale-answer defense is needed — the dead epoch's answers reach a
+	// dead decode loop, and a lingering stale poke is a gen-mismatch no-op (set bumps
+	// gen on the next send). desired is untouched, so the resume re-subscribes it.
+	applyEpochReset := func() {
+		disarmAck()
+		c.subFlight.clear()
+		c.subs.resetGrants()
+	}
+	// drainReset consumes a queued epoch reset (non-blocking), applying it and
+	// reporting whether one was drained. It MUST be called AFTER the currentConn()
+	// read on every send-capable path, and the caller MUST NOT send with the pre-read
+	// state when it returns true. That ordering is what makes reset-before-send
+	// airtight despite select having no priority: the supervisor enqueues the reset
+	// BEFORE it dials the next epoch, so if currentConn() returned conn N+1, then
+	// reset(≤N)-enqueue happened-before setConn(N+1) happened-before the read
+	// happened-before this drain — the drain therefore provably sees every reset the
+	// read's connection supersedes. (Draining BEFORE the read would leave a window:
+	// the read could observe conn N+1 while the reset it superseded is still queued,
+	// only to be drained a loop later and wipe the live flight.)
+	drainReset := func() bool {
+		select {
+		case <-c.subEpochReset:
+			applyEpochReset()
+			return true
+		default:
+			return false
+		}
+	}
+
 	// send records the flight BEFORE the wire send (so a fast ack cannot beat the
 	// decode loop's read of the requested set), arms the ack timeout on a
 	// successful send, and clears the flight on a failed send. process (below)
@@ -204,13 +264,24 @@ func (c *Client) runSubscribeSerializer(ownerCtx context.Context) {
 		switch req.kind {
 		case reqSubscribe:
 			c.subs.addDesired(req.channels)
-			conn := c.currentConn()
-			if conn == nil {
-				// Disconnected: the desired set is updated; the reconnect resume flushes
-				// it (a later slice). No frame, no slot consumed.
+			// Read the conn, THEN drain (see drainReset): a reset that raced the read
+			// belongs to a superseded epoch, so re-read against the reset epoch rather
+			// than send stale. The channels are already in desired, so a re-drive covers
+			// exactly this request. Loop terminates — each drained reset is one epoch
+			// death, rate-limited by the reconnect between them.
+			for {
+				conn := c.currentConn()
+				if conn == nil {
+					// Disconnected: the desired set is updated; the reconnect resume flushes
+					// it on the next epoch-up. No frame, no slot consumed.
+					return
+				}
+				if drainReset() {
+					continue
+				}
+				send(conn, reqSubscribe, req.channels)
 				return
 			}
-			send(conn, reqSubscribe, req.channels)
 		case reqUnsubscribe:
 			// Both-set prune immediately (reflected in the accessors). A wire
 			// `unsubscribe` covers only the channels that were granted; a never-granted
@@ -223,11 +294,49 @@ func (c *Client) runSubscribeSerializer(ownerCtx context.Context) {
 			if conn == nil {
 				return
 			}
+			if drainReset() {
+				// A reset raced the read: the new epoch has nothing subscribed, so
+				// wasGranted (computed against the dead epoch's grants) is void — send no
+				// wire unsubscribe. desired was already pruned, so the resume will not
+				// re-subscribe these channels either.
+				return
+			}
 			send(conn, reqUnsubscribe, wasGranted)
+		}
+	}
+	// serviceResume flushes a pending resume when idle: it subscribes the current
+	// pending set (desired − granted). One flag, two triggers — reconnect (all
+	// desired) and escalation (the denied subset). Like the subscribe arm it reads the
+	// conn FIRST then drains a raced reset, and on a drained reset it RETRIES in the
+	// same call (not returns): the reset may be the stale predecessor of the very
+	// resume signal that set the flag, so deferring to "the next epoch-up resume"
+	// would wedge the flag set forever on an idle-epoch reconnect. A nil conn retains
+	// the flag (epoch-up re-services); an empty pending set clears it vacuously.
+	// pending is snapshotted after the drain, so it reflects the cleared grants.
+	serviceResume := func() {
+		if !resubscribePending || c.subFlight.isActive() {
+			return
+		}
+		for {
+			conn := c.currentConn()
+			if conn == nil {
+				return // no socket yet; the flag stays set, epoch-up re-services
+			}
+			if drainReset() {
+				continue // a reset raced the read; re-read against the post-reset epoch
+			}
+			resubscribePending = false
+			pending := c.subs.pendingSnapshot()
+			if len(pending) == 0 {
+				return
+			}
+			send(conn, reqSubscribe, pending)
+			return
 		}
 	}
 
 	for {
+		serviceResume()
 		// Accept a new request only when idle — leave requests buffered in subReqCh
 		// while one is outstanding (single-outstanding, FR-001a).
 		var reqCh <-chan subReq
@@ -240,6 +349,14 @@ func (c *Client) runSubscribeSerializer(ownerCtx context.Context) {
 			return
 		case req := <-reqCh:
 			process(req)
+		case <-c.subEpochReset:
+			// An epoch ended (also wakes an idle-blocked serializer). Pure state reset;
+			// the resume re-subscribes desired on the next epoch-up.
+			applyEpochReset()
+		case <-c.subResume:
+			// Re-subscribe the pending set — serviced at idle by serviceResume, not
+			// enqueued (a resume must not consume a queue slot or wait behind requests).
+			resubscribePending = true
 		case g := <-c.subPoke:
 			// The outstanding request was answered (the decode loop reconciled and
 			// emitted in receive order). Release the slot and disarm the timeout — but
@@ -354,6 +471,31 @@ func (c *Client) pokeSubscribeSerializer(gen uint64) {
 	}
 	select {
 	case c.subPoke <- gen:
+	default:
+	}
+}
+
+// resetSubscribeSerializer tells the serializer an epoch ended, so it drops the
+// outstanding flight, disarms the ack timeout, and clears the granted set. Called
+// by the supervisor right after the epoch dies (alongside resetAuthOwner), BEFORE
+// the next dial — so the reset is queued before any send on the new epoch can race
+// it. Non-blocking (buffered 1).
+func (c *Client) resetSubscribeSerializer() {
+	select {
+	case c.subEpochReset <- struct{}{}:
+	default:
+	}
+}
+
+// resumeSubscribeSerializer tells the serializer to re-subscribe its pending set.
+// Two producers: the supervisor on epoch-up (reconnect resume — granted was
+// cleared, so the whole desired set is pending) and the auth-owner on an
+// escalation commit (the newly-permitted denial subset). Non-blocking (buffered 1);
+// multiple signals coalesce into the one resume flag. The pending set is recomputed
+// when the serializer services it, so a coalesced signal loses nothing.
+func (c *Client) resumeSubscribeSerializer() {
+	select {
+	case c.subResume <- struct{}{}:
 	default:
 	}
 }
