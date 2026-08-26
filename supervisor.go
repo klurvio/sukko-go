@@ -111,6 +111,11 @@ func (c *Client) run(connectCtx context.Context) {
 	// (never on a failed dial), so a flapping connection keeps backing off.
 	attempt := 0
 	firstDialReported := false
+	// hadEpoch is true once a prior epoch actually ran — the gate for sending
+	// reconnect{last_pos}. It is NOT the same as firstDialReported: a failed first
+	// dial reports Connect but establishes no epoch, so the first SUCCESSFUL connect
+	// still has nothing to resume and must send no reconnect frame.
+	hadEpoch := false
 	var override *time.Duration
 
 	for {
@@ -160,6 +165,23 @@ func (c *Client) run(connectCtx context.Context) {
 			continue
 		}
 
+		// Reconnect-replay: on a RE-connect (a prior epoch ran — hadEpoch, NOT merely
+		// "the first dial was answered") send reconnect{client_id, last_pos} to reopen
+		// the server's replay window, and open the SDK's replay window so the server's
+		// replayed records are tagged SourceReplay. This is sent on the LOCAL conn
+		// BEFORE setConn publishes it to currentConn() — the serializer's and
+		// auth-owner's send gate — so reconnect provably LEADS the resume subscribe and
+		// any auth frame on the wire (FR-006); setConn-first would let a resume that was
+		// pending from a prior epoch race ahead of it. The window is ASSIGNED every
+		// epoch-up (open iff a reconnect was sent), never toggled, so a mid-window
+		// death cannot leak an open window into an epoch that sends no reconnect. It is
+		// set before runEpoch (the decode loop, same goroutine) reads it.
+		sentReconnect := false
+		if hadEpoch {
+			sentReconnect = c.sendReconnect(conn)
+		}
+		c.replayWin.set(sentReconnect)
+
 		// Connected: reset the backoff and run the epoch.
 		c.setConn(conn)
 		// Close (or a lifetime cancel) can land exactly as the dial completes.
@@ -191,6 +213,7 @@ func (c *Client) run(connectCtx context.Context) {
 		c.resumeSubscribeSerializer()
 
 		out, rootStopped := c.runEpoch(conn)
+		hadEpoch = true // an epoch ran; the next successful connect is a reconnect
 		// The epoch ended. Clear the live-conn reference so the auth-owner's
 		// conn-nil guard actually holds between epochs — otherwise it would fetch a
 		// TokenSource and send on a dead socket while reconnecting, burning
@@ -199,6 +222,12 @@ func (c *Client) run(connectCtx context.Context) {
 		// Tell the auth-owner to abandon any refresh outstanding on this now-dead
 		// connection (its answer will never arrive).
 		c.resetAuthOwner()
+		// SLICE-4 HAZARD (recovery *PossibleGap snapshot): T131 must snapshot the set
+		// granted in the epoch that just ended, but resetSubscribeSerializer() below
+		// asynchronously clears the granted set. When that snapshot lands, read
+		// grantedSnapshot() HERE — before this reset enqueue — or the snapshot races
+		// the wipe and emits an empty *PossibleGap, losing the loss signal.
+		//
 		// Tell the serializer the epoch ended: drop the outstanding flight, disarm its
 		// timeout, and clear the granted set. Enqueued here — BEFORE the next dial — so
 		// the reset provably precedes any send on the reconnected epoch (the
@@ -635,11 +664,23 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		if g, ok := c.outstandingGen(reqUnsubscribe); ok {
 			c.pokeSubscribeSerializer(g)
 		}
+	case *wireReconnectAck, *wireReconnectError:
+		// The reconnect-replay round-trip is answered: close the window so subsequent
+		// records are tagged live again (no more SourceReplay override). Then fall
+		// through to surface *Resumed / *ReconnectError in receive order.
+		c.replayWin.close()
 	}
 
 	ev, serr := surfaceEvent(decoded)
 	switch {
 	case serr == nil:
+		// Recovery post-processing on the decode goroutine: for a message-class event,
+		// resolve the final Source (reconnect-replay window override) and update the
+		// pos cursor — Source FIRST, then the cursor keyed on it, so a replayed record
+		// never advances the cursor (FR-006).
+		if m, ok := ev.(*Message); ok {
+			c.applyRecovery(m)
+		}
 		c.forward(e.ctx, ev)
 	case errors.Is(serr, errNotSurfaceFrame):
 		// A control-derived (subscription_ack, auth_ack) frame. Its side effects —

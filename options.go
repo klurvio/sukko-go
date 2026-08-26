@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Configuration is functional options over a validated internal config.
@@ -404,6 +405,12 @@ func (c *config) validateBounds() error {
 
 	case c.rand == nil:
 		return errors.New("sukko: WithRand requires a non-nil source")
+
+	case c.clientID != "" && strings.ContainsFunc(c.clientID, unicode.IsSpace):
+		// A whitespace-bearing id would corrupt the reconnect frame's resume key. An
+		// empty clientID is not an error here: NewClient generates one, so the
+		// effective id is always non-empty.
+		return fmt.Errorf("sukko: ClientID must not contain whitespace, got %q", c.clientID)
 	}
 
 	for _, d := range []struct {

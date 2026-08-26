@@ -72,6 +72,12 @@ type Client struct {
 	// subs holds the subscription sets (granted/desired), read by the caller-facing
 	// accessors and written by the subscribe serializer (sole writer).
 	subs *subState
+	// cursor holds the per-channel opaque `pos` (last_pos), written by the decode
+	// goroutine (sole writer) and read by the reconnect path. Supervisor-lifetime.
+	cursor *posCursor
+	// replayWin is open on a reconnected epoch between reconnect{last_pos} and its
+	// ack, during which live-shaped records are the server's replay (SourceReplay).
+	replayWin replayWindow
 	// subReqCh is the bounded subscribe-serializer request queue (SubscribeQueueDepth):
 	// Subscribe/Unsubscribe non-blocking-send here and return; full ⇒ ErrSubscribeQueueFull.
 	subReqCh chan subReq
@@ -134,6 +140,16 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 	if err := cfg.validate(url); err != nil {
 		return nil, err
 	}
+	// Mint a resume identity when the caller supplied none (WithClientID). Done
+	// after validate and before the client is built, so cfg.clientID is the final
+	// effective id everywhere it is read.
+	if cfg.clientID == "" {
+		id, err := generateClientID()
+		if err != nil {
+			return nil, err
+		}
+		cfg.clientID = id
+	}
 
 	rootCtx, rootCancel := context.WithCancel(ctx)
 	counters := &counters{}
@@ -174,6 +190,7 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 		authDialCred:    make(chan authDialReq),
 		authEscalateCmd: make(chan struct{}, 1),
 		subs:            newSubState(),
+		cursor:          newPosCursor(),
 		subReqCh:        make(chan subReq, SubscribeQueueDepth),
 		subPoke:         make(chan uint64, 1),
 		subEpochReset:   make(chan struct{}, 1),
