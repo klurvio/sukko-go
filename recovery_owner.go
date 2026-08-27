@@ -37,6 +37,9 @@ const (
 	recEvReplayComplete
 	// recEvGrant: the channels a subscription_ack granted — the re-drive trigger.
 	recEvGrant
+	// recEvReplayFailure: a per-channel replay rejection (a server `error` frame
+	// carrying the channel) — interrupts an in-flight replay.
+	recEvReplayFailure
 	// recEvReset: an epoch boundary (admitted by the supervisor at epoch-down).
 	recEvReset
 )
@@ -89,30 +92,32 @@ func (b *recoveryInbox) drain() []recoveryEvent {
 func (c *Client) runRecoveryOwner(ownerCtx context.Context) {
 	defer c.recoverRecoveryOwner()
 
-	fsm := newRecoveryFSM(c.cfg.replayFloor)
+	fsm := newRecoveryFSM(c.cfg.replayFloor, c.cfg.recoveryDeadline)
 
-	var floorTimer Timer
-	var floorC <-chan time.Time
-	disarmFloor := func() {
-		if floorTimer != nil {
-			floorTimer.Stop()
-			floorTimer, floorC = nil, nil
+	var wakeTimer Timer
+	var wakeC <-chan time.Time
+	disarmWake := func() {
+		if wakeTimer != nil {
+			wakeTimer.Stop()
+			wakeTimer, wakeC = nil, nil
 		}
 	}
-	// rearmFloor re-arms the single floor timer to the earliest pending floor wake,
-	// or disarms it when nothing is floor-waiting. A wake already in the past arms a
-	// zero delay (fires on the next tick) rather than looping — but a channel whose
-	// epoch has died is moved off FLOOR_WAIT by the reset (or by due's epoch gate),
-	// so a live-but-unsendable FLOOR_WAIT never persists to spin here.
-	rearmFloor := func() {
-		disarmFloor()
-		wake, ok := fsm.nextFloorWake()
+	// rearmWake re-arms the single owner timer to the earliest pending wake — a floor
+	// wake (purposeReplayFloor) or a recovery deadline (purposeRecoveryDeadline),
+	// whichever is sooner — or disarms it when nothing is pending. The purpose tracks
+	// the winning class so a test rendezvouses on the right timer. A wake already in
+	// the past arms a zero delay (fires next tick) rather than looping — a channel
+	// whose epoch died is moved off FLOOR_WAIT by the reset or due's epoch gate, and a
+	// suspended deadline re-arms to a future time, so no wake persists to spin here.
+	rearmWake := func() {
+		disarmWake()
+		wake, purpose, ok := fsm.nextWake()
 		if !ok {
 			return
 		}
 		after := max(wake.Sub(c.clock.Now()), 0)
-		floorTimer = c.clock.NewTimer(after, purposeReplayFloor)
-		floorC = floorTimer.C()
+		wakeTimer = c.clock.NewTimer(after, purpose)
+		wakeC = wakeTimer.C()
 	}
 	// exec performs the FSM's replay sends. Each action carries the epoch the FSM
 	// chose (always the current one), and the frame goes out on THAT epoch's bound
@@ -126,33 +131,56 @@ func (c *Client) runRecoveryOwner(ownerCtx context.Context) {
 			}
 		}
 	}
+	// interrupt surfaces a *RecoveryInterruptedError per truncated-recovery channel
+	// via ownerSurface — the classed-reserve safety path (parks on the owner context,
+	// discarded only on owner teardown), the same emission the auth-owner uses.
+	interrupt := func(channels []string) {
+		for _, ch := range channels {
+			c.ownerSurface(ownerCtx, &RecoveryInterruptedError{Kind: RecoveryKindReplay, Channel: ch})
+		}
+	}
 
 	for {
 		select {
 		case <-ownerCtx.Done():
-			disarmFloor()
+			disarmWake()
 			return
 		case <-c.recoveryPoke:
-			// Read the current epoch FRESH per event: a drained batch can span an
-			// epoch boundary (a reset then the next epoch's grant), and each event must
-			// be gated against the epoch live when it is processed.
+			// Read the tick FRESH per event: a drained batch can span an epoch boundary
+			// (a reset then the next epoch's grant), and each event must be gated against
+			// the epoch live — and the park state observed — when it is processed.
 			for _, ev := range c.recoveryInbox.drain() {
 				switch ev.kind {
 				case recEvGap:
-					exec(fsm.handleGap(ev.channel, ev.lastPos, c.clock.Now(), c.currentEpochRef(), ev.epoch))
+					exec(fsm.handleGap(ev.channel, ev.lastPos, ev.epoch, c.recoveryTick()))
 				case recEvReplayComplete:
-					exec(fsm.handleReplayComplete(ev.channel, c.clock.Now(), c.currentEpochRef(), ev.epoch))
+					exec(fsm.handleReplayComplete(ev.channel, ev.epoch, c.recoveryTick()))
 				case recEvGrant:
-					exec(fsm.handleGrant(ev.channels, c.clock.Now(), c.currentEpochRef(), ev.epoch))
+					exec(fsm.handleGrant(ev.channels, ev.epoch, c.recoveryTick()))
+				case recEvReplayFailure:
+					interrupt(fsm.handleReplayFailure(ev.channel))
 				case recEvReset:
-					fsm.handleReset()
+					interrupt(fsm.handleReset(c.recoveryTick()))
 				}
 			}
-		case <-floorC:
-			floorTimer, floorC = nil, nil
-			exec(fsm.due(c.clock.Now(), c.currentEpochRef()))
+		case <-wakeC:
+			wakeTimer, wakeC = nil, nil
+			out := fsm.due(c.recoveryTick())
+			exec(out.replays)
+			interrupt(out.interrupts)
 		}
-		rearmFloor()
+		rearmWake()
+	}
+}
+
+// recoveryTick snapshots the owner's clock/epoch context and the delivery park
+// state for one FSM call, so the FSM reads no clock or delivery state of its own.
+func (c *Client) recoveryTick() tick {
+	return tick{
+		now:      c.clock.Now(),
+		current:  c.currentEpochRef(),
+		episodes: c.delivery.parkEpisodes(),
+		parked:   c.delivery.isParked(),
 	}
 }
 
@@ -177,6 +205,15 @@ func (c *Client) admitGap(e *epoch, channel, lastPos string) {
 // goroutine).
 func (c *Client) admitReplayComplete(e *epoch, channel string) {
 	c.recoveryInbox.put(recoveryEvent{kind: recEvReplayComplete, channel: channel, epoch: e})
+	c.pokeRecoveryOwner()
+}
+
+// admitReplayFailure hands a per-channel replay rejection to the recovery owner
+// (decode goroutine), so it interrupts the in-flight replay. It carries no epoch —
+// the stream ordering (failure before the epoch's reset) makes the FSM's phase
+// check sufficient, so no send-gate identity is needed.
+func (c *Client) admitReplayFailure(channel string) {
+	c.recoveryInbox.put(recoveryEvent{kind: recEvReplayFailure, channel: channel})
 	c.pokeRecoveryOwner()
 }
 

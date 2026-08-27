@@ -705,6 +705,15 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		if f.Channel != "" {
 			c.admitReplayComplete(e, f.Channel)
 		}
+	case *wireError:
+		// The contract overloads `error`: a frame carrying a channel is a per-channel
+		// replay rejection (replay_rate_limited, offset_out_of_range, …). Hand it to the
+		// recovery owner to interrupt the in-flight replay, then fall through to surface
+		// *ReplayError (which carries the server code) in receive order. A channel-less
+		// error is a connection-level *ProtocolError and interrupts no replay.
+		if f.Channel != "" {
+			c.admitReplayFailure(f.Channel)
+		}
 	}
 
 	ev, serr := surfaceEvent(decoded)

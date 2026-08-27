@@ -182,6 +182,30 @@ type recoveryChannel struct {
 	lastReplayAt time.Time
 	// floorWake is the absolute time a FLOOR_WAIT may fire.
 	floorWake time.Time
+	// deadline is the absolute time by which an in-flight replay (recReplaying) must
+	// terminate, or an awaiting-grant channel must be re-granted, before its recovery
+	// is declared interrupted (T129). Zero = no deadline armed — recIdle, and
+	// recFloorWait (a floor-wait is bounded by floorWake, not the deadline). It fires
+	// ONLY after a full window has elapsed under a single live epoch with a healthy
+	// consumer: while disconnected, under a different epoch than it was armed under
+	// (armEpoch), or while the delivery consumer stalled, due() suspends (re-arms) it
+	// rather than firing — so backoff/dial wall-clock and epoch churn never expire a
+	// recovery and drop its anchor before the reconnect can re-drive.
+	deadline time.Time
+	// armEpisodes is delivery.parkEpisodes() captured when `deadline` was armed. If a
+	// back-pressure episode opened during the window (parked now, or the count
+	// changed), the missing terminator is the slow consumer's doing, not a dead
+	// recovery — the deadline is suspended (re-armed), never fired. This mirrors the
+	// heartbeat's pong-deadline park-suspension (epoch.go) rather than resetting the
+	// deadline on every replay_message, which would be hot-path observational
+	// interception on the message pipeline (§VII).
+	armEpisodes int64
+	// armEpoch is currentEpochRef() captured when `deadline` was armed. A deadline that
+	// elapses under a DIFFERENT epoch (or under none, while disconnected) has not had a
+	// full window on the live connection — so it is suspended, giving the reconnect's
+	// resume grant a fresh window before the channel is abandoned. Nil when armed while
+	// disconnected. Pointer identity only — never dereferenced.
+	armEpoch *epoch
 	// epoch is the connection this channel's FLOOR_WAIT/REPLAYING belongs to — the
 	// send-gate identity. Nil in recIdle and recAwaitingGrant (no live epoch).
 	epoch *epoch
@@ -196,14 +220,35 @@ type replayAction struct {
 	epoch   *epoch
 }
 
+// recoveryOutcome is what a due()/timer fire produced: replay sends, plus the
+// channels whose recovery was declared interrupted (each surfaces a
+// *RecoveryInterruptedError). The two are returned together because one timer fire
+// can both begin a floor-gated replay and expire another channel's deadline.
+type recoveryOutcome struct {
+	replays    []replayAction
+	interrupts []string
+}
+
+// tick is the owner's clock/epoch context, passed to every FSM method so the FSM
+// stays pure — it reads no clock and touches no delivery state of its own. now is
+// c.clock.Now(); current is c.currentEpochRef() (the send-gate epoch); episodes and
+// parked are c.delivery.parkEpisodes()/isParked() for the deadline's park-suspension.
+type tick struct {
+	now      time.Time
+	current  *epoch
+	episodes int64
+	parked   bool
+}
+
 // recoveryFSM holds the per-channel FSM behind the single-owner goroutine.
 type recoveryFSM struct {
 	floor    time.Duration
+	deadline time.Duration
 	channels map[string]*recoveryChannel
 }
 
-func newRecoveryFSM(floor time.Duration) *recoveryFSM {
-	return &recoveryFSM{floor: floor, channels: map[string]*recoveryChannel{}}
+func newRecoveryFSM(floor, deadline time.Duration) *recoveryFSM {
+	return &recoveryFSM{floor: floor, deadline: deadline, channels: map[string]*recoveryChannel{}}
 }
 
 func (f *recoveryFSM) channelFor(channel string) *recoveryChannel {
@@ -215,15 +260,48 @@ func (f *recoveryFSM) channelFor(channel string) *recoveryChannel {
 	return rec
 }
 
-// beginReplay transitions rec into REPLAYING on `epoch` and returns the send. The
-// caller has already confirmed the floor is open and the epoch is current.
-func (f *recoveryFSM) beginReplay(rec *recoveryChannel, channel, fromPos string, now time.Time, epoch *epoch) []replayAction {
+// beginReplay transitions rec into REPLAYING on the current epoch, arms the recovery
+// deadline, and returns the send. The caller has already confirmed the floor is open
+// and the epoch is current.
+func (f *recoveryFSM) beginReplay(rec *recoveryChannel, channel, fromPos string, t tick) []replayAction {
 	rec.phase = recReplaying
 	rec.anchor = fromPos // kept until replay_complete (divergence from sukko-py)
-	rec.lastReplayAt = now
+	rec.lastReplayAt = t.now
 	rec.floorWake = time.Time{}
-	rec.epoch = epoch
-	return []replayAction{{channel: channel, fromPos: fromPos, epoch: epoch}}
+	rec.deadline = t.now.Add(f.deadline)
+	rec.armEpisodes = t.episodes
+	rec.armEpoch = t.current
+	rec.epoch = t.current
+	return []replayAction{{channel: channel, fromPos: fromPos, epoch: t.current}}
+}
+
+// enterAwaitingGrant parks a channel for a grant-triggered re-drive after its epoch
+// died mid-cycle: it retains `anchor` and arms a FRESH recovery deadline (re-armed
+// on each epoch boundary — every new epoch gets a full window to deliver the
+// re-grant), so a re-grant that never arrives is eventually declared interrupted
+// rather than wedging silently (the Slice-2 → Slice-3 awaiting-grant unwedge).
+func (f *recoveryFSM) enterAwaitingGrant(rec *recoveryChannel, anchor string, t tick) {
+	rec.phase = recAwaitingGrant
+	rec.anchor = anchor
+	rec.followup, rec.hasFollowup = "", false
+	rec.floorWake = time.Time{}
+	rec.deadline = t.now.Add(f.deadline)
+	rec.armEpisodes = t.episodes
+	rec.armEpoch = t.current
+	rec.epoch = nil
+}
+
+// resetToIdle abandons a channel's recovery entirely (deadline expiry or a server
+// replay rejection): the anchor is dropped, so nothing is re-driven. Slice 4 pairs
+// a dropped anchor with a *PossibleGap where appropriate.
+func (f *recoveryFSM) resetToIdle(rec *recoveryChannel) {
+	rec.phase = recIdle
+	rec.anchor = ""
+	rec.followup, rec.hasFollowup = "", false
+	rec.floorWake = time.Time{}
+	rec.deadline = time.Time{}
+	rec.armEpoch = nil
+	rec.epoch = nil
 }
 
 // handleGap coalesces a gap per the arrival-order/conservative-anchor rule and, if
@@ -232,31 +310,30 @@ func (f *recoveryFSM) beginReplay(rec *recoveryChannel, channel, fromPos string,
 // parks the anchor for a grant-triggered re-drive. lastPos is the anchor and is
 // never compared. Precondition: lastPos != "" (an empty last_pos is un-anchorable
 // and is not admitted — the *PossibleGap half lands in Slice 4).
-func (f *recoveryFSM) handleGap(channel, lastPos string, now time.Time, current, evEpoch *epoch) []replayAction {
+func (f *recoveryFSM) handleGap(channel, lastPos string, evEpoch *epoch, t tick) []replayAction {
 	rec := f.channelFor(channel)
 
 	// The gap's epoch is no longer live (its decode raced ahead of a reconnect):
 	// retain an anchor and re-drive when the channel is re-granted. An in-flight
 	// cycle keeps its earlier anchor (covers this gap too).
-	if evEpoch != current {
+	if evEpoch != t.current {
 		if rec.phase == recIdle {
-			rec.anchor = lastPos
-			rec.phase = recAwaitingGrant
-			rec.epoch = nil
+			f.enterAwaitingGrant(rec, lastPos, t)
 		}
 		return nil
 	}
 
 	switch rec.phase {
 	case recIdle:
-		if floorWake := rec.lastReplayAt.Add(f.floor); floorWake.After(now) {
+		if floorWake := rec.lastReplayAt.Add(f.floor); floorWake.After(t.now) {
 			rec.phase = recFloorWait
 			rec.anchor = lastPos
 			rec.floorWake = floorWake
-			rec.epoch = current
+			rec.deadline = time.Time{} // a floor-wait is bounded by floorWake, not the deadline
+			rec.epoch = t.current
 			return nil
 		}
-		return f.beginReplay(rec, channel, lastPos, now, current)
+		return f.beginReplay(rec, channel, lastPos, t)
 	case recFloorWait:
 		// Coalesce: keep the earlier anchor (replaying from it covers this gap).
 	case recReplaying:
@@ -271,7 +348,7 @@ func (f *recoveryFSM) handleGap(channel, lastPos string, now time.Time, current,
 		// the RETAINED anchor now (conservatively covering this gap too) rather than
 		// stall for a subscription_ack grant that a dropped/withheld resume ack might
 		// never deliver. The floor was reset with the epoch, so it is open.
-		return f.beginReplay(rec, channel, rec.anchor, now, current)
+		return f.beginReplay(rec, channel, rec.anchor, t)
 	}
 	return nil
 }
@@ -280,7 +357,7 @@ func (f *recoveryFSM) handleGap(channel, lastPos string, now time.Time, current,
 // begins the follow-up cycle (floor-gated, same epoch); otherwise the channel
 // returns to idle. A complete for a channel not REPLAYING is a stale/duplicate
 // terminator and is ignored.
-func (f *recoveryFSM) handleReplayComplete(channel string, now time.Time, current, evEpoch *epoch) []replayAction {
+func (f *recoveryFSM) handleReplayComplete(channel string, evEpoch *epoch, t tick) []replayAction {
 	rec := f.channels[channel]
 	if rec == nil || rec.phase != recReplaying {
 		return nil
@@ -288,6 +365,8 @@ func (f *recoveryFSM) handleReplayComplete(channel string, now time.Time, curren
 	if !rec.hasFollowup {
 		rec.phase = recIdle
 		rec.anchor = ""
+		rec.deadline = time.Time{}
+		rec.armEpoch = nil // keep the arm invariant uniform (deadline is zeroed, so harmless, but tidy)
 		rec.epoch = nil
 		return nil
 	}
@@ -296,28 +375,27 @@ func (f *recoveryFSM) handleReplayComplete(channel string, now time.Time, curren
 
 	// The completing epoch is gone: re-drive the follow-up from its anchor on the
 	// next grant rather than send on a dead socket.
-	if evEpoch != current {
-		rec.phase = recAwaitingGrant
-		rec.anchor = followup
-		rec.epoch = nil
+	if evEpoch != t.current {
+		f.enterAwaitingGrant(rec, followup, t)
 		return nil
 	}
-	if floorWake := rec.lastReplayAt.Add(f.floor); floorWake.After(now) {
+	if floorWake := rec.lastReplayAt.Add(f.floor); floorWake.After(t.now) {
 		rec.phase = recFloorWait
 		rec.anchor = followup
 		rec.floorWake = floorWake
-		rec.epoch = current
+		rec.deadline = time.Time{} // a floor-wait is bounded by floorWake, not the deadline
+		rec.epoch = t.current
 		return nil
 	}
-	return f.beginReplay(rec, channel, followup, now, current)
+	return f.beginReplay(rec, channel, followup, t)
 }
 
 // handleGrant re-drives the retained replay for any of the granted channels that
 // were left awaiting a re-grant by an epoch death (T130). It fires only when the
 // grant belongs to the current epoch — a stale grant is dropped, because the live
 // epoch's own resume-subscribe grant is guaranteed to re-trigger the re-drive.
-func (f *recoveryFSM) handleGrant(channels []string, now time.Time, current, evEpoch *epoch) []replayAction {
-	if evEpoch != current {
+func (f *recoveryFSM) handleGrant(channels []string, evEpoch *epoch, t tick) []replayAction {
+	if evEpoch != t.current {
 		return nil
 	}
 	var acts []replayAction
@@ -328,67 +406,150 @@ func (f *recoveryFSM) handleGrant(channels []string, now time.Time, current, evE
 		}
 		// The floor was reset with the epoch (handleReset), so it is open; re-drive
 		// from the retained anchor immediately.
-		acts = append(acts, f.beginReplay(rec, channel, rec.anchor, now, current)...)
+		acts = append(acts, f.beginReplay(rec, channel, rec.anchor, t)...)
 	}
 	return acts
 }
 
-// handleReset applies an epoch boundary: every channel mid-cycle (FLOOR_WAIT or
-// REPLAYING) retains its anchor but moves to awaiting-grant so the replay is
-// re-driven on the next epoch, and EVERY channel's floor is reset (T128) — the
-// server's replay limiter is per-connection. A retained follow-up collapses into
-// the head anchor (one re-driven frame per channel). Enqueued through the same
-// inbox as the decode events (the decode loop and this reset are both the
-// supervisor goroutine), so the event stream is totally ordered and a reset
-// applies to exactly the epoch that just died.
-func (f *recoveryFSM) handleReset() {
-	for _, rec := range f.channels {
-		if rec.phase == recFloorWait || rec.phase == recReplaying {
-			rec.phase = recAwaitingGrant
-			rec.followup, rec.hasFollowup = "", false
-			rec.epoch = nil
+// handleReplayFailure interrupts an in-flight replay the server rejected — a
+// per-channel `error` frame carrying the channel (replay_rate_limited,
+// offset_out_of_range, …). The replay is abandoned (resetToIdle drops the anchor:
+// retrying a rejected replay would only be rejected again). No epoch gate is needed
+// — the stream is totally ordered, so a failure for epoch N is processed before
+// reset(N) while the channel is still REPLAYING, and the phase check alone yields
+// exactly one interrupt (the later reset then sees idle). Returns the interrupted
+// channel, or nil if none was replaying.
+func (f *recoveryFSM) handleReplayFailure(channel string) []string {
+	rec := f.channels[channel]
+	if rec == nil || rec.phase != recReplaying {
+		return nil
+	}
+	f.resetToIdle(rec)
+	return []string{channel}
+}
+
+// handleReset applies an epoch boundary. A channel with a replay IN FLIGHT
+// (recReplaying) is a truncated recovery: its channel is returned as an interrupt
+// (a *RecoveryInterruptedError, spec §III) AND its anchor is retained for a
+// grant-triggered re-drive on the new epoch (T130) — the interrupt is the notice,
+// the re-drive is the retry. A FLOOR_WAIT channel has no replay in flight, so it
+// re-drives WITHOUT an interrupt. Every mid-cycle channel enters awaiting-grant with
+// a fresh deadline (re-armed each boundary); the per-channel floor resets with the
+// epoch (T128). Admitted through the same inbox as the decode events (both are the
+// supervisor goroutine), so the stream is totally ordered and a reset applies to
+// exactly the epoch that just died.
+func (f *recoveryFSM) handleReset(t tick) []string {
+	var interrupts []string
+	for channel, rec := range f.channels {
+		switch rec.phase {
+		case recReplaying:
+			interrupts = append(interrupts, channel)
+			f.enterAwaitingGrant(rec, rec.anchor, t)
+		case recFloorWait:
+			f.enterAwaitingGrant(rec, rec.anchor, t)
+		case recAwaitingGrant:
+			// Still awaiting a re-grant across another epoch death — re-arm the deadline
+			// so each new epoch gets a full window to deliver the grant.
+			rec.deadline = t.now.Add(f.deadline)
+			rec.armEpisodes = t.episodes
+			rec.armEpoch = t.current
+		case recIdle:
+			// Nothing in flight; only the floor reset below applies.
 		}
 		rec.lastReplayAt = time.Time{}
-		rec.floorWake = time.Time{}
 	}
+	return interrupts
 }
 
-// due fires any FLOOR_WAIT whose floor has elapsed. A channel whose epoch is no
-// longer current (its epoch died between arming the floor and the timer firing)
-// is parked for a grant-triggered re-drive rather than sent on a dead socket.
-func (f *recoveryFSM) due(now time.Time, current *epoch) []replayAction {
-	var acts []replayAction
+// due fires floor-waits whose floor has elapsed and recovery deadlines that have
+// expired. A FLOOR_WAIT whose epoch died is parked for a grant-triggered re-drive
+// (as in Slice 2). A REPLAYING/awaiting-grant channel past its deadline is a
+// truncated recovery → interrupt + reset to idle — but ONLY if a full window
+// elapsed under a single live epoch with a healthy consumer. The deadline is
+// suspended (re-armed, never fired) while the client is disconnected (backoff/dial
+// time is not a server failure), while the current epoch differs from the one it
+// was armed under (a fresh epoch has not yet had a full window to deliver the
+// resume grant), or while the delivery consumer stalled (parked now, or an episode
+// opened since the arm). The consumer-stall half mirrors the heartbeat's pong
+// deadline; together they are why the deadline need not reset on every
+// replay_message (§VII) and never drops an anchor over an ordinary reconnect.
+func (f *recoveryFSM) due(t tick) recoveryOutcome {
+	var out recoveryOutcome
 	for channel, rec := range f.channels {
-		if rec.phase != recFloorWait || rec.floorWake.After(now) {
-			continue
+		switch rec.phase {
+		case recFloorWait:
+			if rec.floorWake.After(t.now) {
+				continue
+			}
+			if rec.epoch != t.current {
+				f.enterAwaitingGrant(rec, rec.anchor, t)
+				continue
+			}
+			out.replays = append(out.replays, f.beginReplay(rec, channel, rec.anchor, t)...)
+		case recReplaying, recAwaitingGrant:
+			if rec.deadline.IsZero() || rec.deadline.After(t.now) {
+				continue
+			}
+			// Suspend (re-arm, don't fire) the deadline unless a FULL window has elapsed
+			// under one live epoch with a healthy consumer — the only condition under
+			// which a missing terminator is genuinely the server's fault. Fire is
+			// suppressed while: the client is disconnected (current==nil — backoff/dial
+			// wall-clock is not a server failure, and firing would drop the anchor before
+			// the reconnect can re-drive, silently losing the gapped window); the current
+			// epoch differs from the one the deadline was armed under (armEpoch — a fresh
+			// epoch has not yet had a full window to deliver the resume grant, and a
+			// deadline armed on a since-dead epoch must not fire on its successor); or the
+			// delivery consumer stalled during the window (parked now, or an episode
+			// opened since the arm). armEpoch==nil==current alone (armed and fired while
+			// disconnected) is caught by the explicit current==nil check.
+			if t.current == nil || rec.armEpoch != t.current || t.parked || t.episodes != rec.armEpisodes {
+				rec.deadline = t.now.Add(f.deadline)
+				rec.armEpisodes = t.episodes
+				rec.armEpoch = t.current
+				continue
+			}
+			out.interrupts = append(out.interrupts, channel)
+			f.resetToIdle(rec)
+		case recIdle:
+			// No pending wake.
 		}
-		if rec.epoch != current {
-			rec.phase = recAwaitingGrant
-			rec.epoch = nil
-			rec.floorWake = time.Time{}
-			continue
-		}
-		acts = append(acts, f.beginReplay(rec, channel, rec.anchor, now, current)...)
 	}
-	return acts
+	return out
 }
 
-// nextFloorWake returns the earliest absolute time due() needs to run, or false if
-// no channel is floor-waiting — the single-timer arming input (the next_deadline
-// pattern; the Slice-3 recovery deadline folds into the same minimum).
-func (f *recoveryFSM) nextFloorWake() (time.Time, bool) {
+// nextWake returns the earliest absolute time due() must run and the timer purpose
+// to arm it under — purposeReplayFloor for a floor wake, purposeRecoveryDeadline for
+// a recovery deadline — so a test rendezvouses on the right timer and the two
+// classes fold into one owner timer (the next_deadline pattern). false if nothing is
+// pending.
+func (f *recoveryFSM) nextWake() (time.Time, timerPurpose, bool) {
 	var earliest time.Time
+	var purpose timerPurpose
 	found := false
-	for _, rec := range f.channels {
-		if rec.phase != recFloorWait {
-			continue
+	consider := func(at time.Time, p timerPurpose) {
+		if at.IsZero() {
+			return
 		}
-		if !found || rec.floorWake.Before(earliest) {
-			earliest = rec.floorWake
-			found = true
+		// On an exact tie (both classes default to 10s, so a floor wake and a deadline
+		// can coincide) prefer the recovery deadline, so the chosen purpose is
+		// deterministic regardless of map iteration order — a test rendezvousing via
+		// BlockUntilTimer can never hang on the losing purpose. due() handles both
+		// classes on any fire, so the choice is only about the timer's name.
+		if !found || at.Before(earliest) || (at.Equal(earliest) && p == purposeRecoveryDeadline) {
+			earliest, purpose, found = at, p, true
 		}
 	}
-	return earliest, found
+	for _, rec := range f.channels {
+		switch rec.phase {
+		case recFloorWait:
+			consider(rec.floorWake, purposeReplayFloor)
+		case recReplaying, recAwaitingGrant:
+			consider(rec.deadline, purposeRecoveryDeadline)
+		case recIdle:
+			// No pending wake.
+		}
+	}
+	return earliest, purpose, found
 }
 
 // applyRecovery resolves a message-class event's final Source and updates the pos

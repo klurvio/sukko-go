@@ -132,12 +132,22 @@ func (e *EditionRequiredError) Error() string {
 // Is bridges to ErrEditionRequired.
 func (e *EditionRequiredError) Is(target error) bool { return target == ErrEditionRequired }
 
+// Recovery kinds name which recovery a *RecoveryInterruptedError describes. They
+// are the single source of the strings, referenced instead of literals (§I).
+const (
+	// RecoveryKindReplay is a live gap→replay (or reconnect-replay) window.
+	RecoveryKindReplay = "replay"
+	// RecoveryKindHistory is a History request window.
+	RecoveryKindHistory = "history"
+)
+
 // RecoveryInterruptedError reports a recovery that ended without its terminator
 // — a replay or history window cut short by a deadline, a mid-recovery close, or
 // an epoch ending. It exists so a truncated recovery is never surfaced as a bare
 // disconnect, which would leave the caller believing the window completed.
 type RecoveryInterruptedError struct {
-	// Kind is the recovery that was interrupted: "replay" or "history".
+	// Kind is the recovery that was interrupted: RecoveryKindReplay or
+	// RecoveryKindHistory.
 	Kind string
 	// Channel is the affected channel.
 	Channel string
