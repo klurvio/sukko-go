@@ -112,6 +112,12 @@ func (c *Client) runRecoveryOwner(ownerCtx context.Context) {
 	rearmWake := func() {
 		disarmWake()
 		wake, purpose, ok := fsm.nextWake()
+		// Fold the single-flight history deadline into the same timer — it arms under
+		// purposeRecoveryDeadline like a replay deadline, so the owner runs one timer for
+		// both recovery flows.
+		if hWake, hOk := c.historyFlight.nextDeadline(); hOk && (!ok || hWake.Before(wake)) {
+			wake, purpose, ok = hWake, purposeRecoveryDeadline, true
+		}
 		if !ok {
 			return
 		}
@@ -131,12 +137,17 @@ func (c *Client) runRecoveryOwner(ownerCtx context.Context) {
 			}
 		}
 	}
-	// interrupt surfaces a *RecoveryInterruptedError per truncated-recovery channel
-	// via ownerSurface — the classed-reserve safety path (parks on the owner context,
-	// discarded only on owner teardown), the same emission the auth-owner uses.
-	interrupt := func(channels []string) {
+	// surfaceInterrupt emits a *RecoveryInterruptedError via ownerSurface — the
+	// classed-reserve safety path (parks on the owner context, discarded only on owner
+	// teardown), the same emission the auth-owner uses. It is called AFTER the FSM /
+	// historyFlight decision has released its lock (§VII: never surface under the lock,
+	// which parks on back-pressure).
+	surfaceInterrupt := func(kind, channel string) {
+		c.ownerSurface(ownerCtx, &RecoveryInterruptedError{Kind: kind, Channel: channel})
+	}
+	interruptReplay := func(channels []string) {
 		for _, ch := range channels {
-			c.ownerSurface(ownerCtx, &RecoveryInterruptedError{Kind: RecoveryKindReplay, Channel: ch})
+			surfaceInterrupt(RecoveryKindReplay, ch)
 		}
 	}
 
@@ -158,16 +169,28 @@ func (c *Client) runRecoveryOwner(ownerCtx context.Context) {
 				case recEvGrant:
 					exec(fsm.handleGrant(ev.channels, ev.epoch, c.recoveryTick()))
 				case recEvReplayFailure:
-					interrupt(fsm.handleReplayFailure(ev.channel))
+					interruptReplay(fsm.handleReplayFailure(ev.channel))
 				case recEvReset:
-					interrupt(fsm.handleReset(c.recoveryTick()))
+					interruptReplay(fsm.handleReset(c.recoveryTick()))
+					// An epoch boundary also interrupts an in-flight history (it does not
+					// re-drive) — promptly, on the reset, rather than waiting for its deadline.
+					if ch := c.historyFlight.interruptIfEpochDead(c.currentEpochRef()); ch != "" {
+						surfaceInterrupt(RecoveryKindHistory, ch)
+					}
 				}
 			}
 		case <-wakeC:
 			wakeTimer, wakeC = nil, nil
-			out := fsm.due(c.recoveryTick())
+			t := c.recoveryTick()
+			out := fsm.due(t)
 			exec(out.replays)
-			interrupt(out.interrupts)
+			interruptReplay(out.interrupts)
+			// The history deadline shares this timer: an elapsed history with no
+			// terminator (under a live, matching epoch and a draining consumer) is
+			// interrupted; a consumer stall suspends it.
+			if ch := c.historyFlight.due(t, c.cfg.recoveryDeadline); ch != "" {
+				surfaceInterrupt(RecoveryKindHistory, ch)
+			}
 		}
 		rearmWake()
 	}

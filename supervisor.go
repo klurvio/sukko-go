@@ -714,6 +714,17 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		if f.Channel != "" {
 			c.admitReplayFailure(f.Channel)
 		}
+	case *wireHistoryComplete:
+		// Ends the single-flight history (channel-matched). It is a TERMINATOR, not an
+		// interrupt: it falls through to surface *HistoryComplete in receive order.
+		c.releaseHistory(f.Channel)
+	case *wireHistoryError:
+		// Ends the single-flight history (channel-matched). Like history_complete this is
+		// a terminator — it releases the slot and falls through to surface *HistoryError,
+		// NOT a *RecoveryInterruptedError (the deliberate asymmetry with a replay
+		// rejection, which surfaces both): a refused history simply ended, it was not cut
+		// short. History's only interrupt triggers are the deadline and an epoch death.
+		c.releaseHistory(f.Channel)
 	}
 
 	ev, serr := surfaceEvent(decoded)

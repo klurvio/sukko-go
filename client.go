@@ -86,6 +86,11 @@ type Client struct {
 	// non-blocking; the owner drains the whole queue per wake, so a coalesced poke
 	// loses nothing.
 	recoveryPoke chan struct{}
+	// historyFlight is the client-level single-flight slot for History() — one history
+	// outstanding at a time (FR-001b). Claimed by the caller, released (channel-matched)
+	// by the decode loop on a terminator, and interrupted by the recovery owner on the
+	// deadline or an epoch death. A leaf lock, never held across a send.
+	historyFlight historyFlight
 	// subReqCh is the bounded subscribe-serializer request queue (SubscribeQueueDepth):
 	// Subscribe/Unsubscribe non-blocking-send here and return; full ⇒ ErrSubscribeQueueFull.
 	subReqCh chan subReq
@@ -513,6 +518,62 @@ func (c *Client) Subscriptions() []string { return c.subs.grantedSnapshot() }
 // channels a Subscribe asked for that are not (yet) granted — covering both a
 // Subscribe issued while disconnected and the post-ack denial delta.
 func (c *Client) PendingSubscriptions() []string { return c.subs.pendingSnapshot() }
+
+// History requests up to limit historical records for a channel. They arrive
+// in-band as *Message events with Source SourceHistory, terminated by a
+// *HistoryComplete (or a *HistoryError if the server refuses — history is Pro +
+// server-enabled gated). It REQUIRES a live socket and returns *NotConnectedError
+// otherwise — a one-shot request is not meaningfully queued — and ErrClosed once the
+// client is closed. History is SINGLE-FLIGHT: only one call may be outstanding at a
+// time (a second returns ErrHistoryInProgress), because N concurrent windows would
+// put N×HistoryLimit records on the bounded delivery channel. A limit of zero or
+// less uses the configured HistoryLimit; a limit above it returns
+// ErrHistoryLimitExceeded. Unlike a live replay, an interrupted history does not
+// re-drive across a reconnect — an epoch death mid-history surfaces a
+// *RecoveryInterruptedError and the caller re-requests.
+func (c *Client) History(ctx context.Context, channel string, limit int) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("sukko: history: %w", err)
+	}
+	if limit <= 0 {
+		limit = c.cfg.historyLimit
+	}
+	if limit > c.cfg.historyLimit {
+		return ErrHistoryLimitExceeded
+	}
+	c.mu.Lock()
+	state := c.state
+	closed := c.closed
+	c.mu.Unlock()
+	switch {
+	case closed || state == StateClosed || state == StateError:
+		return ErrClosed
+	case state != StateConnected:
+		return &NotConnectedError{Op: "History"}
+	}
+	// Claim against the CURRENT epoch and send on THAT epoch's bound conn (not
+	// currentConn()), so the frame provably rides the epoch stamped in the slot — the
+	// same epoch-gate the recovery owner uses for replays. If the epoch died between
+	// the read and the send, the send fails on its own dead conn.
+	e := c.currentEpochRef()
+	if e == nil {
+		return &NotConnectedError{Op: "History"}
+	}
+	deadline := c.clock.Now().Add(c.cfg.recoveryDeadline)
+	if !c.historyFlight.claim(channel, e, deadline, c.delivery.parkEpisodes()) {
+		return ErrHistoryInProgress
+	}
+	if !c.sendHistoryFrame(e.conn, channel, limit) {
+		// Identity-matched release: the send can block long enough for the owner to
+		// interrupt this flight and a fresh History to re-claim the slot, so free only
+		// the exact (channel, epoch) this call claimed — never an unrelated flight.
+		c.historyFlight.releaseIf(channel, e)
+		return &NotConnectedError{Op: "History"}
+	}
+	// Wake the recovery owner to arm the detection deadline (it reads the slot).
+	c.pokeRecoveryOwner()
+	return nil
+}
 
 // Stats returns an eventually-consistent snapshot of the client's counters.
 func (c *Client) Stats() Stats { return c.counters.snapshot() }

@@ -60,6 +60,12 @@ var (
 	// channel that another is relying on.
 	ErrHistoryInProgress = errors.New("sukko: a history request is already in flight")
 
+	// ErrHistoryLimitExceeded means a History call asked for more records than the
+	// client's configured HistoryLimit. Checked locally before the send, like the
+	// publish payload pre-checks — the server would also reject it, but with nothing
+	// to correlate the rejection to on a fire-and-forget request.
+	ErrHistoryLimitExceeded = errors.New("sukko: history limit exceeds the configured maximum")
+
 	// ErrSubscribeQueueFull means the subscribe serializer's queue is full.
 	// Subscribe-class requests are serialized because the contract carries no
 	// request id, so an ack cannot otherwise be attributed to its request.
