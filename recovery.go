@@ -292,8 +292,7 @@ func (f *recoveryFSM) enterAwaitingGrant(rec *recoveryChannel, anchor string, t 
 }
 
 // resetToIdle abandons a channel's recovery entirely (deadline expiry or a server
-// replay rejection): the anchor is dropped, so nothing is re-driven. Slice 4 pairs
-// a dropped anchor with a *PossibleGap where appropriate.
+// replay rejection): the anchor is dropped, so nothing is re-driven.
 func (f *recoveryFSM) resetToIdle(rec *recoveryChannel) {
 	rec.phase = recIdle
 	rec.anchor = ""
@@ -308,8 +307,9 @@ func (f *recoveryFSM) resetToIdle(rec *recoveryChannel) {
 // the floor is open and the epoch is current, emits a replay; otherwise it waits
 // out the floor (due fires it) or, when the gap's epoch is no longer current,
 // parks the anchor for a grant-triggered re-drive. lastPos is the anchor and is
-// never compared. Precondition: lastPos != "" (an empty last_pos is un-anchorable
-// and is not admitted — the *PossibleGap half lands in Slice 4).
+// never compared. Precondition: lastPos != "" (an empty last_pos is un-anchorable and
+// is not admitted here — the decode loop surfaces its *Gap and an immediate
+// *PossibleGap for that channel instead, supervisor.go).
 func (f *recoveryFSM) handleGap(channel, lastPos string, evEpoch *epoch, t tick) []replayAction {
 	rec := f.channelFor(channel)
 

@@ -91,6 +91,10 @@ type Client struct {
 	// by the decode loop on a terminator, and interrupted by the recovery owner on the
 	// deadline or an epoch death. A leaf lock, never held across a send.
 	historyFlight historyFlight
+	// possibleGaps tracks the cursorless-granted channels snapshotted at each epoch
+	// death, drained into one coalesced *PossibleGap when a reconnect completes or at
+	// teardown (Slice 4). A leaf lock.
+	possibleGaps *possibleGaps
 	// subReqCh is the bounded subscribe-serializer request queue (SubscribeQueueDepth):
 	// Subscribe/Unsubscribe non-blocking-send here and return; full ⇒ ErrSubscribeQueueFull.
 	subReqCh chan subReq
@@ -206,6 +210,7 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 		cursor:          newPosCursor(),
 		recoveryInbox:   newRecoveryInbox(),
 		recoveryPoke:    make(chan struct{}, 1),
+		possibleGaps:    newPossibleGaps(),
 		subReqCh:        make(chan subReq, SubscribeQueueDepth),
 		subPoke:         make(chan uint64, 1),
 		subEpochReset:   make(chan struct{}, 1),

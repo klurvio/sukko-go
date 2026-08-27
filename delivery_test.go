@@ -296,3 +296,27 @@ func TestReceiveOrderIsSendOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestDeliveryTrySendReservesTerminalSlot pins trySend (the *PossibleGap reserve
+// path): it admits safety events only below the safety ceiling, returns false once
+// the ceiling is reached — reserving the last slot — and the final *Terminal still
+// lands in that reserved slot afterward.
+func TestDeliveryTrySendReservesTerminalSlot(t *testing.T) {
+	const q = 4 // safetyCeiling = q-1 = 3
+	d := newDelivery(q, newFakeClock(), &counters{})
+
+	// Fill up to the safety ceiling: q-1 safety events land.
+	for i := range q - 1 {
+		if !d.trySend(&Gap{}) {
+			t.Fatalf("trySend #%d below the ceiling failed", i)
+		}
+	}
+	// At the ceiling, trySend refuses — the last slot is reserved for *Terminal.
+	if d.trySend(&Gap{}) {
+		t.Error("trySend at the safety ceiling succeeded; it must reserve the Terminal slot")
+	}
+	// The *Terminal still lands in its reserved slot.
+	if !d.sendTerminal(&Terminal{}) {
+		t.Error("sendTerminal did not land after trySend filled the reserve to the ceiling")
+	}
+}

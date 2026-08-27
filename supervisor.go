@@ -225,11 +225,16 @@ func (c *Client) run(connectCtx context.Context) {
 		// Tell the auth-owner to abandon any refresh outstanding on this now-dead
 		// connection (its answer will never arrive).
 		c.resetAuthOwner()
-		// SLICE-4 HAZARD (recovery *PossibleGap snapshot): T131 must snapshot the set
-		// granted in the epoch that just ended, but resetSubscribeSerializer() below
-		// asynchronously clears the granted set. When that snapshot lands, read
-		// grantedSnapshot() HERE — before this reset enqueue — or the snapshot races
-		// the wipe and emits an empty *PossibleGap, losing the loss signal.
+		// Snapshot the *PossibleGap set (T131): the channels GRANTED in the epoch that
+		// just ended which hold no pos cursor gapped across the disconnect — the
+		// reconnect{last_pos} can carry no anchor for them — so union them into the
+		// pending set, to be emitted as one coalesced *PossibleGap when the reconnect
+		// completes (or before *Terminal). Read grantedSnapshot() HERE, BEFORE
+		// resetSubscribeSerializer() below asynchronously wipes the granted set — else the
+		// snapshot would race the wipe and lose the loss signal — and unconditionally,
+		// before the clean-stop/outcome returns, so a Close-raced death still surfaces its
+		// pending set at teardown.
+		c.possibleGaps.add(c.subs.grantedSnapshot(), c.cursor)
 		//
 		// Tell the serializer the epoch ended: drop the outstanding flight, disarm its
 		// timeout, and clear the granted set. Enqueued here — BEFORE the next dial — so
@@ -688,9 +693,9 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 	case *wireGap:
 		// A server gap advisory. Count every one received, and hand a well-formed gap
 		// to the recovery owner to drive a live gap→replay (T127/T128). An empty
-		// last_pos is un-anchorable — it surfaces *Gap but drives no replay; its
-		// *PossibleGap pairing lands in Slice 4. Falls through to surface *Gap in
-		// receive order.
+		// last_pos is un-anchorable — it drives no replay; it surfaces *Gap and, in the
+		// post-surface block below, an immediate per-channel *PossibleGap. Falls through
+		// to surface *Gap in receive order.
 		c.counters.gaps.Add(1)
 		if f.Channel != "" && f.LastPos != "" {
 			c.admitGap(e, f.Channel, f.LastPos)
@@ -698,10 +703,9 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 	case *wireReplayComplete:
 		// A replay terminator: hand it to the recovery owner to close out the cycle
 		// (or begin a floor-gated follow-up). A replay REJECTION (a `wireError` with a
-		// channel → *ReplayError) is deliberately NOT handled by the owner in Slice 2 —
-		// the recovery deadline (Slice 3) unwedges a stuck REPLAYING and the un-
-		// anchorable/degrade paths (Slice 4) handle the failure classes. Falls through
-		// to surface *ReplayComplete in receive order.
+		// channel) is handled separately below — the owner interrupts the in-flight
+		// replay and *ReplayError surfaces the code. Falls through to surface
+		// *ReplayComplete in receive order.
 		if f.Channel != "" {
 			c.admitReplayComplete(e, f.Channel)
 		}
@@ -747,6 +751,34 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		// which is itself an Event.
 		if pe, ok := serr.(Event); ok {
 			c.forward(e.ctx, pe)
+		}
+	}
+
+	// *PossibleGap emission, AFTER the frame's own event has surfaced (so *Resumed /
+	// *Gap precede it in receive order). A completed reconnect drains the pending
+	// cursorless-granted snapshot into one coalesced *PossibleGap (empty on a
+	// full-cursor Kafka reconnect → nothing emitted); an un-anchorable gap pairs its
+	// *Gap with an immediate per-channel *PossibleGap.
+	switch f := decoded.(type) {
+	case *wireReconnectAck:
+		c.emitPossibleGap()
+	case *wireReconnectError:
+		// The rarer explicit Direct signal reaches the same degraded outcome; other
+		// reconnect errors surface only *ReconnectError.
+		if f.Code == CodeNotAvailable {
+			c.emitPossibleGap()
+		}
+	case *wireGap:
+		if f.Channel != "" && f.LastPos == "" {
+			// An un-anchorable gap: records were dropped with no cursor to replay from.
+			// A plain delivery send (not the drained-snapshot path) — if it is discarded
+			// on an epoch teardown the channel is granted and cursorless, so it re-enters
+			// the pending snapshot at that very epoch-down and surfaces on the reconnect.
+			// Count only a DELIVERED event (§VI): a send that was discarded and later
+			// re-emits via the snapshot must not be counted twice, nor counted when dropped.
+			if c.delivery.send(c.rootCtx, e.ctx, &PossibleGap{Channels: []string{f.Channel}}) == notDiscarded {
+				c.counters.possibleGaps.Add(1)
+			}
 		}
 	}
 }
@@ -803,6 +835,20 @@ func (c *Client) terminalSequence() {
 		if conn != nil {
 			_ = conn.Close(closeCodeNormalClosure, "") // best-effort; may already be closed
 		}
+		// Emit any still-pending *PossibleGap BEFORE the final *Terminal (T131): a client
+		// that dies still holding a cursorless-granted snapshot (it never reconnected to
+		// drain it) surfaces the loss here. The non-blocking reserve send cannot hang Close.
+		//
+		// ACCEPTED CORNER: this teardown emit is best-effort. The reconnect-path emit
+		// never loses the signal (drainIf retains a failed trySend for the next reconnect
+		// or this teardown), but this is the LAST drain — if the safety reserve is itself
+		// exhausted (only reachable when a consumer has stopped draining and let the
+		// 15-slot reserve fill), the trySend returns false and the pending set is dropped.
+		// Such a consumer has already been discarding parked sends throughout its stall —
+		// the client is in a lossy regime the *Terminal it will eventually drain announces
+		// — so a hard guarantee (a second reserved slot against ADR-0006's reserve
+		// accounting) is disproportionate to this edge (§XV).
+		c.emitPossibleGap()
 		c.delivery.sendTerminal(&Terminal{Err: cause})
 		c.delivery.close()
 		close(c.doneCh)

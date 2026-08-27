@@ -189,6 +189,32 @@ func (d *delivery) sendTerminal(t *Terminal) bool {
 	}
 }
 
+// trySend places a safety-class event into the reserve with a NON-BLOCKING send —
+// the sendTerminal shape, but admitting under the safety ceiling rather than the
+// single Terminal slot. It reports whether the event landed. It exists for drained
+// data-loss signals (*PossibleGap): a parking send there could strand the caller
+// holding an already-cleared snapshot, so the snapshot is cleared only when this
+// returns true, and the reserve argument (safety events are a bounded subset with ≥2×
+// headroom) makes a false return all but unreachable outside genuine reserve
+// exhaustion. Admission is under the same lock as send, so it cannot over-admit past
+// the reserved Terminal slot.
+func (d *delivery) trySend(ev Event) bool {
+	d.mu.Lock()
+	if len(d.ch)+d.reserved < d.safetyCeiling {
+		d.reserved++
+		d.mu.Unlock()
+
+		d.ch <- ev // provably non-blocking: len+reserved < safetyCeiling ≤ QueueSize-1 < cap
+
+		d.mu.Lock()
+		d.reserved--
+		d.mu.Unlock()
+		return true
+	}
+	d.mu.Unlock()
+	return false
+}
+
 // isParked reports whether any send is currently parked on back-pressure. The
 // heartbeat's pong-deadline path reads it to suspend the deadline while the
 // decode loop is stalled, so the SDK never preempts the server's own slow-client
