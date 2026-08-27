@@ -78,6 +78,14 @@ type Client struct {
 	// replayWin is open on a reconnected epoch between reconnect{last_pos} and its
 	// ack, during which live-shaped records are the server's replay (SourceReplay).
 	replayWin replayWindow
+	// recoveryInbox is the lossless hand-off from the decode loop (gap/replay_complete/
+	// grant) and the supervisor (epoch reset) to the recovery owner. One totally-
+	// ordered stream (all producers are the supervisor goroutine).
+	recoveryInbox *recoveryInbox
+	// recoveryPoke wakes the recovery owner to drain recoveryInbox. Buffered(1), sent
+	// non-blocking; the owner drains the whole queue per wake, so a coalesced poke
+	// loses nothing.
+	recoveryPoke chan struct{}
 	// subReqCh is the bounded subscribe-serializer request queue (SubscribeQueueDepth):
 	// Subscribe/Unsubscribe non-blocking-send here and return; full ⇒ ErrSubscribeQueueFull.
 	subReqCh chan subReq
@@ -191,6 +199,8 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 		authEscalateCmd: make(chan struct{}, 1),
 		subs:            newSubState(),
 		cursor:          newPosCursor(),
+		recoveryInbox:   newRecoveryInbox(),
+		recoveryPoke:    make(chan struct{}, 1),
 		subReqCh:        make(chan subReq, SubscribeQueueDepth),
 		subPoke:         make(chan uint64, 1),
 		subEpochReset:   make(chan struct{}, 1),

@@ -19,6 +19,12 @@ type epoch struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// conn is the socket bound to this epoch for its whole life. The recovery owner
+	// sends a replay on THIS conn (not currentConn()), so an epoch-gated replay can
+	// only ever reach the epoch that produced its gap — never a successor epoch on
+	// which the channel is not yet re-subscribed. A send on a just-dead epoch's conn
+	// fails harmlessly; the stream-ordered reset then re-drives on the next grant.
+	conn Conn
 	// pongCh carries the "a pong arrived" signal from the decode loop to the
 	// heartbeat goroutine. Buffered (1) and scoped to this epoch, so a stale
 	// signal can never leak into the next epoch's heartbeat.

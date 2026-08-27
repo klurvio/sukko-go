@@ -77,6 +77,9 @@ func (c *Client) run(connectCtx context.Context) {
 	// The subscribe serializer is the second supervisor-lifetime owner goroutine,
 	// launched and torn down on the same ownerCtx/ownerWg as the auth-owner.
 	ownerWg.Go(func() { c.runSubscribeSerializer(ownerCtx) })
+	// The recovery owner is the third such owner: it drives the gap→replay FSM and is
+	// the sole `replay` sender. Torn down on the same ownerCtx/ownerWg.
+	ownerWg.Go(func() { c.runRecoveryOwner(ownerCtx) })
 
 	// One combined exit defer (§VII: recover is effectively first, and the
 	// terminal sequence runs after the cause is set). On a panic the recover
@@ -233,6 +236,13 @@ func (c *Client) run(connectCtx context.Context) {
 		// the reset provably precedes any send on the reconnected epoch (the
 		// drain-before-send discipline in the serializer relies on this ordering).
 		c.resetSubscribeSerializer()
+		// Admit the recovery epoch reset through the recovery owner's inbox — the same
+		// stream as this epoch's decode-loop events (all on this goroutine) — so it is
+		// ordered after every gap/replay_complete/grant of the epoch that just died and
+		// before any event of the next one. Channels mid-recovery move to awaiting-grant
+		// (re-driven on the new epoch's resume grant), and the per-channel replay floor
+		// resets with the epoch (T128).
+		c.resetRecoveryOwner()
 		// Discriminate on cause, not outcome (as the dial path does): if Close or a
 		// lifetime cancel raced the epoch's end — even if the heartbeat or a panic
 		// won the first-cause slot first, making rootStopped false — the caller's
@@ -401,6 +411,7 @@ func (c *Client) backoffWait(delay time.Duration) bool {
 // outcome). Both goroutines are torn down before it returns.
 func (c *Client) runEpoch(conn Conn) (out terminationOutcome, rootStopped bool) {
 	e := newEpoch(c.rootCtx)
+	e.conn = conn        // bind the socket for the recovery owner's epoch-gated replay sends
 	c.setCurrentEpoch(e) // let the auth-owner reach this epoch's first-cause slot
 	// Registered FIRST so it runs LAST (LIFO): after the decode-loop recover
 	// (below) has had its chance to record a panic, cancel the epoch, wait for the
@@ -635,6 +646,11 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		// Control-plane: hand off, never enqueue.
 		if g, ok := c.reconcileSubscriptionAck(e.ctx, f.Subscribed, f.Count); ok {
 			c.pokeSubscribeSerializer(g)
+			// Hand the granted channels to the recovery owner: on a reconnect the resume
+			// subscribe re-grants the desired set, which is the trigger to re-drive any
+			// replay retained across the epoch boundary (T130). A grant with no retained
+			// recovery is a cheap no-op.
+			c.admitGrant(e, f.Subscribed)
 		}
 		return
 	case *wireUnsubscriptionAck:
@@ -669,6 +685,26 @@ func (c *Client) dispatch(e *epoch, data []byte) {
 		// records are tagged live again (no more SourceReplay override). Then fall
 		// through to surface *Resumed / *ReconnectError in receive order.
 		c.replayWin.close()
+	case *wireGap:
+		// A server gap advisory. Count every one received, and hand a well-formed gap
+		// to the recovery owner to drive a live gap→replay (T127/T128). An empty
+		// last_pos is un-anchorable — it surfaces *Gap but drives no replay; its
+		// *PossibleGap pairing lands in Slice 4. Falls through to surface *Gap in
+		// receive order.
+		c.counters.gaps.Add(1)
+		if f.Channel != "" && f.LastPos != "" {
+			c.admitGap(e, f.Channel, f.LastPos)
+		}
+	case *wireReplayComplete:
+		// A replay terminator: hand it to the recovery owner to close out the cycle
+		// (or begin a floor-gated follow-up). A replay REJECTION (a `wireError` with a
+		// channel → *ReplayError) is deliberately NOT handled by the owner in Slice 2 —
+		// the recovery deadline (Slice 3) unwedges a stuck REPLAYING and the un-
+		// anchorable/degrade paths (Slice 4) handle the failure classes. Falls through
+		// to surface *ReplayComplete in receive order.
+		if f.Channel != "" {
+			c.admitReplayComplete(e, f.Channel)
+		}
 	}
 
 	ev, serr := surfaceEvent(decoded)
