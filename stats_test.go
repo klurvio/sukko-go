@@ -1,6 +1,7 @@
 package sukko
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -85,4 +86,56 @@ func TestBlockedAccumulates(t *testing.T) {
 	if got := c.snapshot().Blocked; got != 5*time.Second {
 		t.Errorf("Blocked = %s, want 5s (2s + 3s)", got)
 	}
+}
+
+// TestStatsScenarioCountersWithConcurrentReader is T150 (NFR-005(p), SC-012): the
+// deterministic counters bump under a real scenario, and Stats() read CONCURRENTLY
+// with delivery is -race-clean — every counter is an atomic, so a reader takes no
+// delivery lock and cannot block the decode goroutine. Epoch 1 dies with a remote
+// close so the client reconnects (Reconnects++); epoch 2 floods the delivery channel
+// with the consumer stopped, opening a back-pressure episode (BackpressureBlocks++). A
+// reader goroutine polls Stats() throughout, so -race exercises the concurrent read.
+// (Gaps/Replays and PossibleGaps are covered in scenario by TestGapDrivesReplay and
+// TestPossibleGapDirectDegrade respectively.)
+func TestStatsScenarioCountersWithConcurrentReader(t *testing.T) {
+	c, err := NewClient(context.Background(), "wss://example.test/ws",
+		WithNoAuth(), WithQueueSize(117), WithHistoryLimit(1),
+		WithBackoff(BackoffConfig{Initial: time.Millisecond, Max: time.Millisecond, Multiplier: 2, Jitter: 0}))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	// Epoch 1: an immediate remote close → reconnect. Epoch 2: floods forever
+	// (closeNow never set) → the decode loop parks with the consumer stopped.
+	flood := &floodThenCloseConn{frame: []byte(`{"type":"message","channel":"acme.x","seq":1,"ts":1,"data":{}}`)}
+	c.transport = &fakeTransport{conns: []Conn{immediateCloseConn{}, flood}}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = c.Stats() // concurrent read, exercised under -race
+			}
+		}
+	}()
+
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	c.delivery.waitUntilBlocked() // epoch 2 parked: one back-pressure episode
+	close(stop)
+	<-done
+
+	got := c.Stats()
+	if got.Reconnects < 1 {
+		t.Errorf("Reconnects = %d, want >= 1 (epoch 1 died and the client reconnected)", got.Reconnects)
+	}
+	if got.BackpressureBlocks < 1 {
+		t.Errorf("BackpressureBlocks = %d, want >= 1 (the flood parked the decode loop)", got.BackpressureBlocks)
+	}
+	closeClient(t, c)
 }

@@ -219,6 +219,14 @@ func (c *Client) run(connectCtx context.Context) {
 		attempt = 0
 		override = nil
 		c.transition(triggerHandshakeOK) // connecting/reconnecting → connected
+		if hadEpoch {
+			// A prior epoch ran, so this successful handshake re-established the
+			// connection — a reconnect (FR-006). Counted here, past the clean-stop check
+			// above, so a Close landing as the dial completes is not miscounted; gated on
+			// hadEpoch to match the reconnect-frame gate, so a first connection after a
+			// failed first dial (hadEpoch still false) is not a reconnect.
+			c.counters.reconnects.Add(1)
+		}
 		if wasFirst {
 			// Report the first dial's SUCCESS only after the state is Connected, so a
 			// caller whose Connect returns nil can immediately RefreshToken/Escalate
