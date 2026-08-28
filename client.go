@@ -17,6 +17,7 @@ import (
 // lifecycle is in supervisor.go, as methods on this same struct.
 type Client struct {
 	cfg   *config
+	url   string // the raw ws(s):// URL passed to NewClient, for deriving the REST base
 	clock Clock
 
 	transport Transport
@@ -190,6 +191,7 @@ func NewClient(ctx context.Context, url string, opts ...Option) (*Client, error)
 
 	c := &Client{
 		cfg:             cfg,
+		url:             url,
 		clock:           cfg.clock,
 		transport:       newWSTransport(url, cfg, credentials),
 		delivery:        newDelivery(cfg.queueSize, cfg.clock, counters),
