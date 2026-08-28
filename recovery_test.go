@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -500,4 +501,97 @@ func TestWithClientIDValidationAndGeneration(t *testing.T) {
 	if !strings.Contains(frame.raw, `"last_pos":{}`) {
 		t.Errorf("cursorless reconnect frame = %s, want last_pos as {} (not null)", frame.raw)
 	}
+}
+
+// TestSubscribeFromInsideMessagesLoopDoesNotDeadlock is T144 row 2 (SC-013): a
+// Subscribe issued from INSIDE a draining `for ev := range client.Messages()` loop
+// completes without deadlock. The serializer's queue is fire-and-forget and never
+// waits on the consumer, so a re-entrant control-plane call from the delivery loop is
+// safe — the proof is the second `subscribe` frame reaching the fake while the loop
+// keeps draining. If Subscribe blocked on anything the loop must itself drain, the
+// loop could never reach the second call and this would hang.
+func TestSubscribeFromInsideMessagesLoopDoesNotDeadlock(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{respond: map[string][]string{
+		typeSubscribe: {`{"type":"subscription_ack","subscribed":["t.a"],"count":1}`},
+	}})
+	c, _ := subClient(t, f, WithClientID("cid"))
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer closeClient(t, c)
+
+	// Re-enter Subscribe on the t.a *SubscriptionResult specifically — not the first
+	// event, which is a connect *StateChange: re-entering then would race the t.b
+	// subscribe against the outstanding t.a one, and a t.b-first ordering would strand
+	// t.a's flight (its ack fails the subset guard). Gating on the result makes the
+	// ordering deterministic (t.a's ack is already reconciled) and exercises the claim.
+	subErr := make(chan error, 1)
+	go func() {
+		reentrant := false
+		for ev := range c.Messages() {
+			if _, ok := ev.(*SubscriptionResult); ok && !reentrant {
+				reentrant = true
+				subErr <- c.Subscribe(context.Background(), []string{"t.b"})
+			}
+		}
+	}()
+
+	if err := c.Subscribe(context.Background(), []string{"t.a"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	// The loop received the t.a *SubscriptionResult and re-entered Subscribe from within
+	// the delivery loop without deadlocking.
+	select {
+	case err := <-subErr:
+		if err != nil {
+			t.Fatalf("re-entrant Subscribe: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("consumer loop never re-entered Subscribe — deadlock")
+	}
+	// The re-entrant subscribe frame reached the wire while the loop kept draining.
+	waitForFrameCount(t, f, typeSubscribe, 2)
+}
+
+// TestControlPlaneResolvesWhileDataBacklogUndrained is T144 row 1 (SC-013): a
+// subscription_ack that decode has READ resolves the control-plane state
+// (Subscriptions/PendingSubscriptions) synchronously, even though the derived
+// *SubscriptionResult — a DATA-class event — cannot yet be delivered because the data
+// region is at its ceiling. The data region is filled first (white-box, decode idle)
+// and the consumer is stopped, so decode reconciles the grant and then PARKS on the
+// result emit: the grant is observable via Subscriptions() while the result is still
+// undelivered. Asserting on Subscriptions() (not on the derived *SubscriptionResult, a
+// data event the reserve keeps behind the backlog) is the point of the row.
+func TestControlPlaneResolvesWhileDataBacklogUndrained(t *testing.T) {
+	f := newFakeWS(t)
+	f.script(epochScript{respond: map[string][]string{
+		typeSubscribe: {`{"type":"subscription_ack","subscribed":["t.a"],"count":1}`},
+	}})
+	c, _ := subClient(t, f, WithClientID("cid"), WithQueueSize(117), WithHistoryLimit(1))
+	// No consumer: the connect preamble and the fill stay buffered.
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Fill the data region to its ceiling BEFORE subscribing, with decode idle, so the
+	// ack's *SubscriptionResult emit is the send that parks.
+	fillDataRegion(t, c)
+
+	if err := c.Subscribe(context.Background(), []string{"t.a"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	// Decode reads the ack, reconciles the grant, then parks on the result emit (the
+	// data region is full).
+	c.delivery.waitUntilBlocked()
+
+	// The control-plane state is resolved even though the *SubscriptionResult is stuck
+	// behind the full data region.
+	if got := c.Subscriptions(); !slices.Contains(got, "t.a") {
+		t.Errorf("Subscriptions() = %v, want to include t.a (grant resolved while its result is undelivered)", got)
+	}
+	if got := c.PendingSubscriptions(); len(got) != 0 {
+		t.Errorf("PendingSubscriptions() = %v, want empty (t.a was granted)", got)
+	}
+	closeClient(t, c)
 }

@@ -3,6 +3,7 @@ package sukko
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // The delivery tests drive the classed reserve (ADR-0006). The reserve's whole
@@ -318,5 +319,205 @@ func TestDeliveryTrySendReservesTerminalSlot(t *testing.T) {
 	// The *Terminal still lands in its reserved slot.
 	if !d.sendTerminal(&Terminal{}) {
 		t.Error("sendTerminal did not land after trySend filled the reserve to the ceiling")
+	}
+}
+
+// fillDataRegion pushes data events straight into the client's delivery channel until
+// it sits at EXACTLY the data ceiling — a white-box fill (the delivery-layer tests
+// already build occupancy this way with d.send) that leaves a data send one slot from
+// parking while a safety send still has the reserve. The decode goroutine must be idle
+// (no pending server frames), so these are the only sends in flight and nothing parks.
+func fillDataRegion(t *testing.T, c *Client) {
+	t.Helper()
+	dc := c.delivery.dataCeiling
+	for len(c.delivery.ch) < dc {
+		if r := c.delivery.send(context.Background(), context.Background(), &Message{Channel: "t.fill", Seq: 1}); r != notDiscarded {
+			t.Fatalf("fill send discarded (%v) before reaching the data ceiling", r)
+		}
+	}
+}
+
+// waitForChannelLen polls the client's delivery channel occupancy up to `want`. It is
+// the white-box sync point for "the flood has been admitted" when the consumer is
+// stopped and no wire frame marks completion (the events arrive server-driven).
+func waitForChannelLen(t *testing.T, c *Client, want int) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for len(c.delivery.ch) < want {
+		select {
+		case <-deadline:
+			t.Fatalf("delivery channel len stuck at %d, want %d", len(c.delivery.ch), want)
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// TestAdvisoriesCannotStarveTerminal is T148 (NFR-005(mmm)): a stream of publish
+// advisories (*PublishAccepted — a DATA-class event, capped at the data ceiling) can
+// never take the *Terminal's reserved slot. With the consumer stopped, the client is
+// fed N `publish_ack` frames and then closed; the final *Terminal is always delivered
+// as the last event before the channel closes and Err() is nil — whether N overfills
+// the data region (the excess advisories park and are discarded on the root-cancel
+// close) or sits below AdvisoryHeadroom. Both rows share one script and differ only in
+// N, so the item discriminates on the CLASSING (the Terminal slot is inviolate), not on
+// incidental capacity.
+func TestAdvisoriesCannotStarveTerminal(t *testing.T) {
+	const queueSize = 117 // dataCeiling = 101, AdvisoryHeadroom = 16
+	tests := []struct {
+		name     string
+		n        int
+		overfill bool
+	}{
+		{"more advisories than the data region holds", 110, true}, // > dataCeiling: advisories park
+		{"fewer advisories than AdvisoryHeadroom", 10, false},     // < 16: never near a ceiling
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeWS(t)
+			resp := make([]string, 0, tc.n+1)
+			resp = append(resp, `{"type":"subscription_ack","subscribed":["t.a"],"count":1}`)
+			for range tc.n {
+				resp = append(resp, `{"type":"publish_ack","channel":"t.a"}`)
+			}
+			f.script(epochScript{respond: map[string][]string{typeSubscribe: resp}})
+
+			c, _ := subClient(t, f, WithClientID("cid"), WithQueueSize(queueSize), WithHistoryLimit(1))
+			if err := c.Connect(context.Background()); err != nil {
+				t.Fatalf("Connect: %v", err)
+			}
+			if err := c.Subscribe(context.Background(), []string{"t.a"}); err != nil {
+				t.Fatalf("Subscribe: %v", err)
+			}
+
+			// Wait for the flood to settle: overfill parks a send at the data ceiling;
+			// underfill admits all N advisories plus the one *SubscriptionResult.
+			if tc.overfill {
+				c.delivery.waitUntilBlocked()
+			} else {
+				// n advisories + the *SubscriptionResult + 2 connect *StateChange all
+				// settle below the ceiling; wait for all of them so Close doesn't cancel
+				// the epoch mid-burst and drop the tail advisories.
+				waitForChannelLen(t, c, tc.n+3)
+			}
+
+			// Close returns within its bound even with the data region full of parked
+			// advisories — the parked sends discard on the root cancel.
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := c.Close(ctx); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if err := c.Err(); err != nil {
+				t.Errorf("Err() = %v, want nil (clean close)", err)
+			}
+
+			// Drain what remains: the last event before channel-close must be *Terminal.
+			var events []Event
+			for ev := range c.Messages() {
+				events = append(events, ev)
+			}
+			if len(events) == 0 {
+				t.Fatal("no events delivered; expected at least the *Terminal")
+			}
+			if _, ok := events[len(events)-1].(*Terminal); !ok {
+				t.Errorf("last event = %T, want *Terminal as the final event before channel-close", events[len(events)-1])
+			}
+
+			got := 0
+			for _, ev := range events {
+				if _, ok := ev.(*PublishAccepted); ok {
+					got++
+				}
+			}
+			if tc.overfill {
+				// The excess advisories parked past the data ceiling and were discarded on
+				// close; only what fit is delivered — but the Terminal lands regardless.
+				if got >= tc.n {
+					t.Errorf("delivered %d advisories, want < %d (the overflow must be discarded)", got, tc.n)
+				}
+			} else if got != tc.n {
+				t.Errorf("delivered %d advisories, want all %d", got, tc.n)
+			}
+		})
+	}
+}
+
+// TestReserveAdmissionEndToEnd is T149 (NFR-005(y) end-to-end row): with the data
+// region filled to its ceiling and the consumer stopped, safety-class events still
+// reach the caller through the reserve — the timer-driven *RecoveryInterruptedError
+// and then the supervisor's *Terminal are both admitted while data delivery is at the
+// ceiling. The producers are the recovery-deadline timer and the supervisor, never the
+// idle decode goroutine.
+//
+// NOTE: the spec's literal "park the decode goroutine" clause predates Slice 3a, whose
+// recovery deadline SUSPENDS while a send is parked (a stalled consumer must not
+// preempt the server's own slow-client verdict — recovery.go due()). So this fills to
+// EXACTLY the data ceiling: nothing parks, the deadline fires cleanly, and the true
+// discriminator — safety admission while the data region is at capacity — is preserved.
+func TestReserveAdmissionEndToEnd(t *testing.T) {
+	f := newFakeWS(t)
+	// ack t.a, then a gap → one replay goes out, is never answered, leaving t.a
+	// REPLAYING with the recovery deadline armed.
+	f.script(epochScript{respond: map[string][]string{
+		typeSubscribe: {
+			`{"type":"subscription_ack","subscribed":["t.a"],"count":1}`,
+			`{"type":"gap","channel":"t.a","last_pos":"g-1","from_seq":1,"to_seq":9,"ts":1}`,
+		},
+	}})
+	c, fc := subClient(t, f, WithClientID("cid"), WithQueueSize(117), WithHistoryLimit(1))
+	// No consumer: the preamble and the fill stay buffered.
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if err := c.Subscribe(context.Background(), []string{"t.a"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitForFrameCount(t, f, typeReplay, 1) // replay in flight, recovery deadline armed
+	// The *Gap is forwarded AFTER admitGap on the decode goroutine, so the replay frame
+	// alone does not prove decode finished the gap emit. Wait for all four preamble
+	// events (2 connect *StateChange + *SubscriptionResult + *Gap) so decode is provably
+	// idle before the fill — otherwise a stray *Gap send could race the fill past the
+	// ceiling and park it on the (never-advanced) fake clock, deadlocking the test.
+	waitForChannelLen(t, c, 4)
+
+	// Fill the data region to EXACTLY its ceiling: a data send would now park, but
+	// nothing is parked yet (so the deadline stays fireable — Slice 3a suspends it
+	// while a send is parked).
+	dc := c.delivery.dataCeiling
+	fillDataRegion(t, c)
+	waitForChannelLen(t, c, dc)
+
+	// Fire the recovery deadline: the owner admits *RecoveryInterruptedError into the
+	// reserve even though the data region is full — the reserve is what carries it.
+	fc.BlockUntilTimer(purposeRecoveryDeadline)
+	fc.Advance(DefaultRecoveryDeadline)
+	waitForChannelLen(t, c, dc+1) // the interrupt landed in the reserve, data still full
+
+	// Cancel the root: the supervisor admits *Terminal into its reserved slot.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// One drain: the interrupt was observed and the *Terminal is the final event.
+	var events []Event
+	for ev := range c.Messages() {
+		events = append(events, ev)
+	}
+	sawInterrupt := false
+	for _, ev := range events {
+		if ri, ok := ev.(*RecoveryInterruptedError); ok && ri.Channel == "t.a" {
+			sawInterrupt = true
+		}
+	}
+	if !sawInterrupt {
+		t.Error("no *RecoveryInterruptedError{t.a} observed — the timer-driven interrupt was not admitted through the reserve while the data region was full")
+	}
+	if len(events) == 0 {
+		t.Fatal("no events drained")
+	}
+	if _, ok := events[len(events)-1].(*Terminal); !ok {
+		t.Errorf("last event = %T, want *Terminal as the final event", events[len(events)-1])
 	}
 }
