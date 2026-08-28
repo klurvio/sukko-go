@@ -53,6 +53,12 @@ type terminationOutcome struct {
 	// beats the client's exponential guess. A present zero means "dial
 	// immediately".
 	retryAfter *time.Duration
+	// countsTowardBackpressure marks the slow-client close (remote 1008) — the one
+	// ending whose reconnect feeds the consecutive-cycle counter behind
+	// ErrConsumerTooSlow, but only when the epoch also actually experienced
+	// back-pressure. Set only in classifyClose's reconnect branch; a zero value on
+	// every other termination path is correct.
+	countsTowardBackpressure bool
 }
 
 // run is the supervisor goroutine. connectCtx bounds only the first dial.
@@ -120,6 +126,19 @@ func (c *Client) run(connectCtx context.Context) {
 	// still has nothing to resume and must send no reconnect frame.
 	hadEpoch := false
 	var override *time.Duration
+	// bpReconnects counts CONSECUTIVE back-pressure-induced reconnects (a slow-client
+	// 1008 whose epoch actually experienced back-pressure). It increments on such a
+	// reconnect, freezes on any other reconnect cause, and resets to zero when an epoch
+	// runs without back-pressure (the consumer resumed draining). At
+	// maxBackpressureReconnects it terminates with ErrConsumerTooSlow (FR-006/FR-010).
+	bpReconnects := 0
+	// episodesAtUp is delivery.parkEpisodes() snapshotted at each handshake, so a park
+	// episode DURING the epoch is a race-free witness that a send parked (the channel
+	// was full) — the "occupancy>0 and ≥1 parked send" condition the 1008 verdict was
+	// closed against. An instantaneous end-state read would be post-mortem (the
+	// epochCtx cancel discards the parked send at death); this mirrors the heartbeat's
+	// pong-deadline park-suspension (epoch.go).
+	var episodesAtUp int64
 
 	for {
 		if firstDialReported {
@@ -215,6 +234,12 @@ func (c *Client) run(connectCtx context.Context) {
 		// so auth (if any) leads, though the serializer and auth-owner are independent.
 		c.resumeSubscribeSerializer()
 
+		// Snapshot the back-pressure episode count at the handshake, before any of this
+		// epoch's data is delivered — a later increase (or a still-parked send) witnesses
+		// that THIS epoch backed up. Placed after the reconnect/resume sends, which are
+		// control frames and never fill the delivery channel.
+		episodesAtUp = c.delivery.parkEpisodes()
+
 		out, rootStopped := c.runEpoch(conn)
 		hadEpoch = true // an epoch ran; the next successful connect is a reconnect
 		// The epoch ended. Clear the live-conn reference so the auth-owner's
@@ -256,6 +281,43 @@ func (c *Client) run(connectCtx context.Context) {
 		if rootStopped || c.rootCtx.Err() != nil {
 			c.transition(c.stopTrigger())
 			return
+		}
+		// Back-pressure reconnect counting (T132), AFTER the clean-stop discriminator
+		// (a Close racing the 1008 is a clean stop, never ErrConsumerTooSlow) and BEFORE
+		// applyOutcome. A slow-client 1008 whose epoch actually backed up
+		// (out.countsTowardBackpressure + a park episode since the handshake, or a send
+		// still parked — the isParked() OR parkEpisodes-changed shape the heartbeat uses)
+		// is a back-pressure-induced reconnect: count it. A clean epoch (no back-pressure)
+		// resets the run — the consumer resumed draining. A non-1008 reconnect that DID
+		// back up (a network 1006) freezes the count: the consumer has not resumed, so the
+		// run must survive.
+		if out.class == classReconnect {
+			backpressured := c.delivery.isParked() || c.delivery.parkEpisodes() != episodesAtUp
+			act := backpressureStep(bpReconnects, out.countsTowardBackpressure, backpressured, c.cfg.maxBackpressureReconnects)
+			bpReconnects = act.count
+			if act.counted {
+				c.counters.backpressureReconnects.Add(1)
+			}
+			if act.terminate {
+				// The consumer never caught up across the tolerated cycles: give up.
+				// Surface THIS cycle's 1008 *CloseError, then terminate with
+				// ErrConsumerTooSlow — REPLACING the reconnect outcome (do not also
+				// applyOutcome(out), which would surface the *CloseError twice).
+				co, ok := lookupInternalCausePolicy(causeConsumerTooSlow, c.cfg.reconnect)
+				if !ok {
+					// An unenumerated internal cause is terminal, never a silent reconnect
+					// (mirrors recoverEpoch): the zero closeOutcome's class is classReconnect,
+					// exactly the trap the policy tables guard against, so force terminal.
+					co = closeOutcome{class: classTerminal}
+				}
+				c.applyOutcome(terminationOutcome{
+					class:   co.class,
+					cause:   ErrConsumerTooSlow,
+					surface: out.surface,
+					trigger: triggerForClass(co.class),
+				})
+				return
+			}
 		}
 		if c.applyOutcome(out) {
 			return
@@ -551,7 +613,10 @@ func (c *Client) classifyClose(ce *CloseError) terminationOutcome {
 
 	switch out.class {
 	case classReconnect:
-		return terminationOutcome{class: classReconnect, cause: ce, surface: surface, trigger: triggerReconnectClassFailure}
+		// Propagate the slow-client (1008) marker so the supervisor can feed the
+		// back-pressure reconnect counter — but only on the reconnect branch: a
+		// downgraded clean stop or a terminal close never counts toward it.
+		return terminationOutcome{class: classReconnect, cause: ce, surface: surface, trigger: triggerReconnectClassFailure, countsTowardBackpressure: out.countsTowardBackpressure}
 	case classCleanStop:
 		if out.surfacesCloseError {
 			// The WithReconnect(false) downgrade of a reconnect-class close:

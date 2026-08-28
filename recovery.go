@@ -120,6 +120,39 @@ func (c *Client) sendReconnect(conn Conn) bool {
 	return conn.Send(c.rootCtx, frame) == nil
 }
 
+// ─── back-pressure reconnect counting (Slice 5) ───
+
+// bpAction is the decision for one reconnect-class epoch termination: the new
+// consecutive back-pressure count, whether this reconnect counted toward it (bump
+// the stat), and whether the count reached the limit (terminate with
+// ErrConsumerTooSlow).
+type bpAction struct {
+	count     int
+	counted   bool
+	terminate bool
+}
+
+// backpressureStep folds one reconnect-class epoch termination into the consecutive
+// back-pressure-reconnect count (T132). A slow-client close (countsTowardBackpressure
+// — the remote 1008) whose epoch actually backed up (backpressured) is a
+// back-pressure-induced reconnect: increment, and terminate at max. An epoch that did
+// NOT back up (backpressured false) means the consumer resumed draining → reset to
+// zero. A reconnect that backed up but is NOT the slow-client close (e.g. a network
+// 1006 mid-back-pressure) freezes the count: the consumer has not resumed, so the run
+// must survive without either counting or resetting. Pure — the supervisor supplies
+// the delivery/park state and enacts the terminal.
+func backpressureStep(prev int, countsTowardBackpressure, backpressured bool, limit int) bpAction {
+	switch {
+	case countsTowardBackpressure && backpressured:
+		n := prev + 1
+		return bpAction{count: n, counted: true, terminate: n >= limit}
+	case !backpressured:
+		return bpAction{count: 0}
+	default:
+		return bpAction{count: prev}
+	}
+}
+
 // ─── gap → replay recovery FSM (Slice 2) ───
 
 // The recovery FSM is a pure per-channel action machine — the sukko-py
