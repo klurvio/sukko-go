@@ -438,7 +438,7 @@ operations:
     description: >
       Request delivery of historical messages for a previously-subscribed channel.
       The client must be subscribed before sending this request.
-      Requires Pro or higher edition.
+      Available on all editions.
       Responds with zero or more `broadcast` messages (each with `history: true`) followed by a `history_complete` message.
       On error, responds with a `history_error` message.
     messages:
@@ -465,7 +465,7 @@ operations:
       Sent when a history request fails validation or encounters a storage error.
       Error codes:
         - `history_disabled`: history feature not enabled on this server (not retriable — feature is off)
-        - `not_available`: Pro or higher edition required, or JWT expired
+        - `not_available`: JWT expired
         - `history_not_subscribed`: client must subscribe to the channel first
         - `history_time_range_not_supported`: from_ts/to_ts queries are not supported in v1
         - `history_invalid_limit`: limit out of range [1, MAX_HISTORY_LIMIT]
@@ -680,7 +680,7 @@ components:
           type: object
           description: >
             If present, triggers subscribe-with-history after the subscription is established.
-            Requires Pro or higher edition and `WS_HISTORY_ENABLED=true`.
+            Requires `WS_HISTORY_ENABLED=true`.
           required:
             - limit
           properties:
@@ -792,7 +792,19 @@ components:
             Absent (omitted) for messages from the Direct backend and for history messages
             stored with auto-assigned Valkey IDs (legacy entries written before Kafka-coordinate XADD was introduced).
             Clients use this as a durable replay cursor: persist the most recent `pos` per channel and send it
-            back in `last_pos` on reconnect.
+            back in `last_pos` on reconnect. `pos` is a replay cursor, not a message identity — use `mid` to
+            recognize the same message across live, replay, and history deliveries.
+        mid:
+          type: string
+          maxLength: 64
+          description: >
+            Stable message identity. The same message carries the same `mid` on every copy delivered —
+            live broadcast, gap replay (`replay_message`), and history — unlike `seq` (per-connection)
+            and `pos` (a per-channel replay cursor). Use it for client-side deduplication (e.g.
+            reconnect-replay overlap), idempotent processing, and correlation. Opaque, at most 64
+            characters; the format varies by backend and may change between releases — never parse it,
+            and never send it as a replay cursor (`from_pos`/`last_pos` accept `pos` values only).
+            Omitted for messages stored before the field was introduced.
       examples:
         - type: message
           seq: 1234
@@ -800,6 +812,7 @@ components:
           channel: "sukko.general.messages"
           data: { "text": "Hello everyone!", "sender": "user123" }
           pos: "3-1234"
+          mid: "9c5b1f0a3d2e6c47-2-1234"
         - type: message
           seq: 1
           ts: 1706000000000
@@ -807,6 +820,7 @@ components:
           data: { "price": "65432.10" }
           history: true
           pos: "1-99"
+          mid: "4f8a2e6b0c9d1735-0-99"
 
     SubscriptionAck:
       type: object
@@ -882,10 +896,19 @@ components:
           type: string
           const: accepted
           description: Always "accepted" on success.
+        mid:
+          type: string
+          maxLength: 64
+          description: >
+            Stable message identity assigned to the published message — the same `mid` subscribers
+            receive on the delivered envelope. Opaque, at most 64 characters. Omitted when the
+            publish fans out to multiple topics (one publish then produces multiple messages,
+            each with its own mid).
       examples:
         - type: publish_ack
           channel: "sukko.general.messages"
           status: accepted
+          mid: "9c5b1f0a3d2e6c47-2-1235"
 
     PublishError:
       type: object
@@ -1292,7 +1315,17 @@ components:
           description: The message payload.
         pos:
           type: string
-          description: Kafka position of this message (optional).
+          description: >
+            Kafka position of this message (optional). A replay cursor, not a message
+            identity — use `mid` to recognize the same message across deliveries.
+        mid:
+          type: string
+          maxLength: 64
+          description: >
+            Stable message identity (optional). Identical to the `mid` the same message carried
+            (or would have carried) on its live and history deliveries — use it to deduplicate
+            replayed messages against ones already received. Opaque; never send it as a replay
+            cursor.
       examples:
         - type: replay_message
           seq: 101
@@ -1302,6 +1335,7 @@ components:
             price: "65432.10"
             volume: "0.5"
           pos: "2-12345"
+          mid: "4f8a2e6b0c9d1735-1-12345"
 
     ReplayComplete:
       type: object
@@ -1640,7 +1674,7 @@ components:
         Error code retriability:
         - `history_disabled`: not retriable — the feature is off at the server level
         - `history_storage_unavailable`: retriable — Valkey is temporarily unreachable; retry with exponential backoff
-        - All other codes: not retriable without fixing the root cause (subscribe first, adjust limit, upgrade edition, etc.)
+        - All other codes: not retriable without fixing the root cause (subscribe first, adjust limit, etc.)
       contentType: application/json
       payload:
         $ref: "#/components/schemas/HistoryError"

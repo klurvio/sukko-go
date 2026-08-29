@@ -179,6 +179,7 @@ type wireMessage struct {
 	TS      int64           `json:"ts"`
 	Pos     string          `json:"pos,omitempty"`
 	History bool            `json:"history,omitempty"`
+	Mid     string          `json:"mid,omitempty"`
 	Data    json.RawMessage `json:"data"`
 }
 
@@ -191,6 +192,7 @@ type wireReplayMessage struct {
 	Seq     int64           `json:"seq"`
 	TS      int64           `json:"ts"`
 	Pos     string          `json:"pos,omitempty"`
+	Mid     string          `json:"mid,omitempty"`
 	Data    json.RawMessage `json:"data"`
 }
 
@@ -235,6 +237,7 @@ type wirePublishAck struct {
 	Type    string `json:"type"`
 	Status  string `json:"status"`
 	Channel string `json:"channel"`
+	Mid     string `json:"mid,omitempty"`
 }
 
 // wirePublishError carries no channel, so a publish failure cannot be attributed

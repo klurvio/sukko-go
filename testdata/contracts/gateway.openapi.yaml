@@ -21,10 +21,19 @@ info:
     ## Edition Gates
 
     Some endpoints require a specific license edition:
-    - **Pro**: SSE streaming (`GET /sse`), REST publish (`POST /api/v1/publish`)
-    - **Enterprise**: Push notification endpoints (`/api/v1/push/*`)
+    - **Pro**: SSE streaming (`GET /sse`), push notification endpoints (`/api/v1/push/*` — Web Push)
+    - **Enterprise**: registering `android`/`ios` devices on `POST /api/v1/push/subscribe` (FCM/APNs mobile push)
 
-    Community edition users receive 403 with `EDITION_LIMIT` when accessing gated endpoints.
+    REST publish (`POST /api/v1/publish`) is available on every edition — no edition gate.
+
+    Requests below the required edition receive 403 with `EDITION_LIMIT`.
+
+    ## Push Surface Availability
+
+    The push endpoints (`/api/v1/push/*`) exist only when the gateway runs with
+    `GATEWAY_PUSH_ENABLED=true` (the push service is deploy-optional). On a
+    gateway without the push surface these routes are not registered and
+    return 404.
 
     ## Error Format
 
@@ -230,7 +239,7 @@ paths:
         ```
         id: {sequence}
         event: message
-        data: {"type":"message","seq":1,"ts":1706000000000,"channel":"sukko.BTC.trade","data":{...}}
+        data: {"type":"message","seq":1,"ts":1706000000000,"channel":"sukko.BTC.trade","data":{...},"mid":"4f8a2e6b0c9d1735-0-1"}
         ```
 
         Keepalive comments (`: keepalive`) are sent periodically to keep the connection alive.
@@ -304,7 +313,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  # ── REST Publish (Pro) ─────────────────────────────────────────────
+  # ── REST Publish (Community) ───────────────────────────────────────
   /api/v1/publish:
     post:
       operationId: publish
@@ -313,7 +322,7 @@ paths:
         Publish a JSON message to a channel via REST. The message is forwarded to ws-server
         via gRPC and broadcast to all subscribed WebSocket/SSE clients.
 
-        **Edition**: Pro (SSE Transport feature gate)
+        **Edition**: Community (available on all editions — no edition gate)
 
         **Rate limiting**: Per-tenant + per-IP. Returns 429 when exceeded.
 
@@ -324,7 +333,7 @@ paths:
         - queryToken: []
         - apiKey: []
         - apiKeyQuery: []
-      x-edition: pro
+      x-edition: community
       requestBody:
         required: true
         content:
@@ -353,9 +362,18 @@ paths:
                     type: string
                   channel:
                     type: string
+                  mid:
+                    type: string
+                    maxLength: 64
+                    description: >
+                      Stable message identity assigned to the published message — the same `mid`
+                      subscribers receive on the delivered envelope. Opaque, at most 64 characters.
+                      Omitted when the publish fans out to multiple topics (one publish then
+                      produces multiple messages, each with its own mid).
               example:
                 status: "accepted"
                 channel: "sukko.general.messages"
+                mid: "9c5b1f0a3d2e6c47-2-1235"
         "400":
           description: |
             Invalid request. Codes: `INVALID_REQUEST` — malformed body, wrong
@@ -377,11 +395,11 @@ paths:
                 $ref: "#/components/schemas/Error"
         "403":
           description: |
-            Forbidden — one of: edition gate (requires Pro), API-key-only
-            authentication (publish requires JWT), channel tenant prefix
-            mismatch, or the tenant's channel rules deny publish to this
-            channel (per-tenant publish rules are the sole publish
-            authorization source; a tenant with no publish rules is denied).
+            Forbidden — one of: API-key-only authentication (publish requires
+            JWT), channel tenant prefix mismatch, or the tenant's channel
+            rules deny publish to this channel (per-tenant publish rules are
+            the sole publish authorization source; a tenant with no publish
+            rules is denied).
           content:
             application/json:
               schema:
@@ -395,7 +413,7 @@ paths:
             rules provisioned at all, or it has rules but none match this channel. In both
             cases the message cannot be produced to a topic and is rejected (never silently
             dead-lettered). Resolve by provisioning a routing rule whose pattern matches the
-            channel. The direct (Community) backend has no routing rules and never returns this.
+            channel. The direct backend has no routing rules and never returns this.
           content:
             application/json:
               schema:
@@ -434,7 +452,7 @@ paths:
                 code: SERVICE_UNAVAILABLE
                 message: "publish temporarily unavailable, retry"
 
-  # ── Push Subscribe (Enterprise) ────────────────────────────────────
+  # ── Push Subscribe (Pro) ───────────────────────────────────────────
   /api/v1/push/subscribe:
     post:
       operationId: pushSubscribe
@@ -443,14 +461,15 @@ paths:
         Register a device for push notifications on specified channels.
         Platform-specific fields are required depending on the platform.
 
-        **Edition**: Enterprise (Push Notifications feature gate)
+        **Edition**: Pro (Web Push feature gate). Registering `android`/`ios`
+        platforms additionally requires Enterprise (Mobile Push feature gate).
       tags: [Push]
       security:
         - bearerToken: []
         - queryToken: []
         - apiKey: []
         - apiKeyQuery: []
-      x-edition: enterprise
+      x-edition: pro
       requestBody:
         required: true
         content:
@@ -518,7 +537,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "403":
-          description: Edition gate — requires Enterprise
+          description: |
+            Edition gate — requires Pro (Web Push); `android`/`ios` platforms
+            require Enterprise (Mobile Push)
           content:
             application/json:
               schema:
@@ -536,14 +557,14 @@ paths:
       description: |
         Remove a device's push notification registration.
 
-        **Edition**: Enterprise (Push Notifications feature gate)
+        **Edition**: Pro (Web Push feature gate)
       tags: [Push]
       security:
         - bearerToken: []
         - queryToken: []
         - apiKey: []
         - apiKeyQuery: []
-      x-edition: enterprise
+      x-edition: pro
       requestBody:
         required: true
         content:
@@ -582,7 +603,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "403":
-          description: Edition gate — requires Enterprise
+          description: Edition gate — requires Pro (Web Push)
           content:
             application/json:
               schema:
@@ -594,7 +615,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  # ── VAPID Key (Enterprise) ─────────────────────────────────────────
+  # ── VAPID Key (Pro) ────────────────────────────────────────────────
   /api/v1/push/vapid-key:
     get:
       operationId: getVapidKey
@@ -603,14 +624,14 @@ paths:
         Retrieve the VAPID public key for the authenticated tenant.
         Used by web clients to create Web Push subscriptions.
 
-        **Edition**: Enterprise (Push Notifications feature gate)
+        **Edition**: Pro (Web Push feature gate)
       tags: [Push]
       security:
         - bearerToken: []
         - queryToken: []
         - apiKey: []
         - apiKeyQuery: []
-      x-edition: enterprise
+      x-edition: pro
       responses:
         "200":
           description: VAPID public key
@@ -631,7 +652,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "403":
-          description: Edition gate — requires Enterprise
+          description: Edition gate — requires Pro (Web Push)
           content:
             application/json:
               schema:

@@ -35,11 +35,18 @@ type Event interface {
 // Data is the raw payload, left undecoded on the hot path. DataAs[T] decodes it
 // into a caller type; Pos is an opaque cursor, stored and echoed but never
 // parsed or compared.
+//
+// Mid is the stable message identity: the same value on every copy of a message
+// — live, history, and replay — so a caller can deduplicate a record it already
+// saw (for example a reconnect-replay overlap) or key idempotent processing on
+// it. Opaque like Pos, but distinct in kind: Pos anchors recovery, Mid names the
+// message. Empty on a server that predates the field.
 type Message struct {
 	Channel string
 	Seq     int64
 	TS      int64
 	Pos     string
+	Mid     string
 	Data    json.RawMessage
 	Source  MessageSource
 }
@@ -111,8 +118,15 @@ func (*Unsubscribed) isEvent() {}
 
 // PublishAccepted reports that a publish was accepted. It names the channel from
 // the ack, so a caller with several publishes in flight can attribute it.
+//
+// Mid is the stable message identity the gateway assigned to the accepted
+// message — the same value subscribers receive on Message.Mid, so a publisher
+// can correlate its publish with the delivered copy (this is the WS-path twin of
+// PublishResult.Mid). Empty for a multi-topic fan-out publish or a gateway that
+// predates the field.
 type PublishAccepted struct {
 	Channel string
+	Mid     string
 }
 
 func (*PublishAccepted) isEvent() {}

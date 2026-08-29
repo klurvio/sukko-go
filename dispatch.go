@@ -108,6 +108,7 @@ func surfaceEvent(decoded any) (Event, error) {
 			Seq:     f.Seq,
 			TS:      f.TS,
 			Pos:     f.Pos,
+			Mid:     f.Mid,
 			Data:    f.Data,
 			// live, or history when the frame says so. The replay-window
 			// override (SourceReplay for a live frame arriving inside the
@@ -124,6 +125,7 @@ func surfaceEvent(decoded any) (Event, error) {
 			Seq:     f.Seq,
 			TS:      f.TS,
 			Pos:     f.Pos,
+			Mid:     f.Mid,
 			Data:    f.Data,
 			Source:  SourceReplay,
 		}, nil
@@ -149,7 +151,7 @@ func surfaceEvent(decoded any) (Event, error) {
 		if err := requireChannel(typePublishAck, f.Channel); err != nil {
 			return nil, err
 		}
-		return &PublishAccepted{Channel: f.Channel}, nil
+		return &PublishAccepted{Channel: f.Channel, Mid: f.Mid}, nil
 
 	case *wirePublishError:
 		return &PublishError{Code: f.Code, Message: f.Message}, nil

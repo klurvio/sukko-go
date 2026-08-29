@@ -214,3 +214,72 @@ func TestClientDerivedAndSilentDispositions(t *testing.T) {
 		t.Error("pong must be internally silent — the one wire type with no caller-visible form")
 	}
 }
+
+// Mid — the stable message identity — must surface on the public Message across
+// every provenance (live, history, replay), so a caller can deduplicate a record
+// it already saw on a reconnect-replay overlap.
+func TestMessageMidSurfaced(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame string
+		want  string
+	}{
+		{"live", `{"type":"message","channel":"acme.x","seq":1,"ts":1,"mid":"cafe-2-9","data":{}}`, "cafe-2-9"},
+		{"history", `{"type":"message","channel":"acme.x","seq":1,"ts":1,"history":true,"mid":"cafe-2-9","data":{}}`, "cafe-2-9"},
+		{"replay", `{"type":"replay_message","channel":"acme.x","seq":1,"ts":1,"mid":"cafe-2-9","data":{}}`, "cafe-2-9"},
+		{"absent (old server)", `{"type":"message","channel":"acme.x","seq":1,"ts":1,"data":{}}`, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			decoded, _, err := decodeFrame([]byte(tc.frame))
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			ev, err := surfaceEvent(decoded)
+			if err != nil {
+				t.Fatalf("surfaceEvent: %v", err)
+			}
+			msg, ok := ev.(*Message)
+			if !ok {
+				t.Fatalf("surfaced %T, want *Message", ev)
+			}
+			if msg.Mid != tc.want {
+				t.Errorf("Mid = %q, want %q", msg.Mid, tc.want)
+			}
+		})
+	}
+}
+
+// A WS publish_ack carries the stable message identity the gateway assigned; it
+// must reach the caller on PublishAccepted, symmetric with PublishResult.Mid on
+// the REST path, so a publisher can correlate its publish with the delivered
+// copy. Absent (multi-topic fan-out / old gateway) → empty.
+func TestPublishAcceptedMidSurfaced(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame string
+		want  string
+	}{
+		{"present", `{"type":"publish_ack","status":"accepted","channel":"acme.x","mid":"beef-1-7"}`, "beef-1-7"},
+		{"absent", `{"type":"publish_ack","status":"accepted","channel":"acme.x"}`, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			decoded, _, err := decodeFrame([]byte(tc.frame))
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			ev, err := surfaceEvent(decoded)
+			if err != nil {
+				t.Fatalf("surfaceEvent: %v", err)
+			}
+			ack, ok := ev.(*PublishAccepted)
+			if !ok {
+				t.Fatalf("surfaced %T, want *PublishAccepted", ev)
+			}
+			if ack.Mid != tc.want {
+				t.Errorf("Mid = %q, want %q", ack.Mid, tc.want)
+			}
+		})
+	}
+}

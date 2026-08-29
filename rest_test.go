@@ -25,6 +25,9 @@ func TestRESTPublishRoundTrip(t *testing.T) {
 	if res.Channel != "acme.x" {
 		t.Errorf("Channel = %q, want acme.x", res.Channel)
 	}
+	if res.Mid != "" {
+		t.Errorf("Mid = %q, want empty (server omitted it)", res.Mid)
+	}
 
 	reqs := g.requests()
 	if len(reqs) != 1 {
@@ -306,5 +309,22 @@ func wantRateLimit(t *testing.T, err error) {
 	var rle *RateLimitError
 	if !errors.As(err, &rle) {
 		t.Fatalf("err = %v, want *RateLimitError", err)
+	}
+}
+
+// The 200 body's mid — the stable message identity of the published message —
+// surfaces on PublishResult; absent for a multi-topic fan-out publish (or an old
+// gateway), which the server signals by omitting it.
+func TestRESTPublishMid(t *testing.T) {
+	g := newFakeGateway(t)
+	g.route(restPublishPath, gatewayResponse{status: 200, body: `{"status":"accepted","channel":"acme.x","mid":"beef-1-7"}`})
+	c := restClient(t, g, WithToken("jwt-abc"))
+
+	res, err := c.RESTPublish(context.Background(), "acme.x", map[string]any{"k": "v"})
+	if err != nil {
+		t.Fatalf("RESTPublish: %v", err)
+	}
+	if res.Mid != "beef-1-7" {
+		t.Errorf("Mid = %q, want beef-1-7", res.Mid)
 	}
 }

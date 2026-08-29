@@ -20,15 +20,22 @@ const restMaxErrorBody = 64 * 1024
 
 // PublishResult is the outcome of a successful RESTPublish. The gateway's 200 body also
 // carries a const status ("accepted") which is dropped — the caller cannot act on it.
+//
+// Mid is the stable message identity the gateway assigned to the published
+// message — the same value subscribers receive on the delivered Message.Mid, so
+// a publisher can correlate its publish with the delivery. Empty when the publish
+// fanned out to multiple topics (each produced message gets its own mid) or on a
+// gateway that predates the field.
 type PublishResult struct {
 	Channel string
+	Mid     string
 }
 
-// restPublishResponse decodes the channel from the gateway's 200 publish body. The
-// body also carries a const status ("accepted") which is not decoded — the caller
-// cannot act on it, so PublishResult exposes only Channel.
+// restPublishResponse decodes the gateway's 200 publish body. The body also carries
+// a const status ("accepted") which is not decoded — the caller cannot act on it.
 type restPublishResponse struct {
 	Channel string `json:"channel"`
+	Mid     string `json:"mid"`
 }
 
 // errorEnvelope is the gateway's {code, message} error body, shared by every non-2xx.
@@ -93,7 +100,7 @@ func (c *Client) RESTPublish(ctx context.Context, channel string, data any) (*Pu
 		if err := json.Unmarshal(respBody, &r); err != nil {
 			return nil, fmt.Errorf("sukko: rest publish: decoding the response: %w", err)
 		}
-		return &PublishResult{Channel: r.Channel}, nil
+		return &PublishResult{Channel: r.Channel, Mid: r.Mid}, nil
 	}
 	return nil, c.restPublishError(resp.StatusCode, respBody, resp.Header)
 }
@@ -162,8 +169,11 @@ func (c *Client) restPublishError(status int, body []byte, header http.Header) e
 	env.Message = c.redactor.redact(env.Message)
 	switch {
 	case env.Code == "EDITION_LIMIT":
-		// The 403 body carries only {code, message}; the required edition is a static
-		// property of the call site (REST publish ⇒ Pro), not read from the wire.
+		// Legacy-gateway compatibility: REST publish is ungated post-remap, so a
+		// current gateway never returns EDITION_LIMIT here. An older gateway that
+		// still gates publish gated it at Pro, and the 403 body carries only
+		// {code, message}, so the required edition is supplied from that static
+		// knowledge rather than read from the wire.
 		return &EditionRequiredError{Code: env.Code, RequiredEdition: EditionPro}
 	case status == http.StatusTooManyRequests || env.Code == "RATE_LIMITED":
 		// Retry-After is parsed from any 429, including a proxy/CDN in front of the

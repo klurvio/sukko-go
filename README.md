@@ -77,7 +77,7 @@ cancels with the context.
 
 ```go
 client.Publish(ctx, "acme.trades", data)     // over the WS connection (fire-and-forget)
-client.RESTPublish(ctx, "acme.trades", data) // REST — no WS needed (Pro)
+client.RESTPublish(ctx, "acme.trades", data) // REST — no WS needed (available on every edition)
 ```
 
 ## Auth

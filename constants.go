@@ -88,14 +88,18 @@ const (
 func (s HistorySource) String() string { return string(s) }
 
 // Edition names a licensed platform edition. The SDK sets it from its own
-// knowledge of which gate an operation crossed, never from a response body:
-// REST publish and SSE require Pro, push requires Enterprise.
+// knowledge of which gate an operation crossed, never from a response body: the
+// SSE transport requires Pro, and mobile push (FCM/APNs) requires Enterprise.
+// REST publish is available on every edition and crosses no edition gate — an
+// EDITION_LIMIT on a publish therefore only reaches this SDK from a gateway that
+// predates that change, and is still surfaced as EditionPro (the edition that
+// gate required).
 type Edition string
 
 const (
-	// EditionPro is required for REST publish and the SSE transport.
+	// EditionPro is required for the SSE transport.
 	EditionPro Edition = "pro"
-	// EditionEnterprise is required for push subscription management.
+	// EditionEnterprise is required for mobile push (FCM/APNs) delivery.
 	EditionEnterprise Edition = "enterprise"
 )
 
