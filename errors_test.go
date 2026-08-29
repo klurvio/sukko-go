@@ -107,6 +107,9 @@ func TestStandaloneSentinelsMatchThroughWrapping(t *testing.T) {
 		ErrTokenSourceFailed,
 		ErrInsecureTransport,
 		ErrPublishRequiresJWT,
+		ErrInvalidPushOptions,
+		ErrPushDisabled,
+		ErrPushUnavailable,
 	} {
 		wrapped := fmt.Errorf("sdk operation: %w", sentinel)
 		if !errors.Is(wrapped, sentinel) {
@@ -141,9 +144,16 @@ func TestSentinelsAreDistinct(t *testing.T) {
 		// text — so it is a sentinel like the rest, and is counted here so this
 		// enumeration stays the complete set it claims to be.
 		"ErrInvalidChannel": ErrInvalidChannel,
+		// Push-management sentinels (Phase 10). Distinguishing "push not enabled
+		// on the gateway" (permanent) from "push temporarily unavailable" and
+		// "bad options" is caller-facing, so each is a sentinel matched via
+		// errors.Is.
+		"ErrInvalidPushOptions": ErrInvalidPushOptions,
+		"ErrPushDisabled":       ErrPushDisabled,
+		"ErrPushUnavailable":    ErrPushUnavailable,
 	}
-	if len(all) != 15 {
-		t.Fatalf("expected 15 sentinels, listed %d", len(all))
+	if len(all) != 18 {
+		t.Fatalf("expected 18 sentinels, listed %d", len(all))
 	}
 	for nameA, a := range all {
 		for nameB, b := range all {
@@ -203,6 +213,8 @@ func TestErrorMessages(t *testing.T) {
 		{"TokenSourceError names the attempt", &TokenSourceError{Attempt: 3, Cause: errors.New("timeout")}, []string{"3", "timeout"}},
 		{"AuthError names the code", &AuthError{Code: "invalid_token"}, []string{"invalid_token"}},
 		{"PublishError names the code", &PublishError{Code: "message_too_large"}, []string{"message_too_large"}},
+		{"PushError names code and message", &PushError{Code: "INVALID_REQUEST", Message: "bad body"}, []string{"INVALID_REQUEST", "bad body"}},
+		{"PushError message-less names the code", &PushError{Code: "HTTP_502"}, []string{"HTTP_502"}},
 		{"HistoryError names the code", &HistoryError{Code: "history_disabled"}, []string{"history_disabled"}},
 		{"ReplayError names code and channel", &ReplayError{Code: "replay_failed", Channel: "acme.trades"}, []string{"replay_failed", "acme.trades"}},
 		{"ReconnectError names the code", &ReconnectError{Code: CodeNotAvailable}, []string{CodeNotAvailable}},

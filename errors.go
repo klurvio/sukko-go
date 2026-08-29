@@ -98,6 +98,23 @@ var (
 	// ErrEmptyToken means UpdateToken or Escalate was called with an empty string.
 	// Supplying no credential where one is required is a caller mistake, not a no-op.
 	ErrEmptyToken = errors.New("sukko: a non-empty token is required")
+
+	// ErrInvalidPushOptions means a PushSubscribe option set failed the local
+	// pre-check (unknown platform, no channels, or a platform's required fields
+	// missing). Caught before any network I/O so a malformed registration never
+	// reaches the gateway.
+	ErrInvalidPushOptions = errors.New("sukko: invalid push subscription options")
+
+	// ErrPushDisabled means the gateway has no push surface: it runs with
+	// GATEWAY_PUSH_ENABLED=false and the push routes are not registered (HTTP
+	// 404). This is a deployment fact, not a transient outage — the remedy is to
+	// enable push on the gateway, so it is distinct from ErrPushUnavailable.
+	ErrPushDisabled = errors.New("sukko: push is not enabled on this gateway")
+
+	// ErrPushUnavailable means the push service exists but is temporarily
+	// unavailable (HTTP 503) — a retryable outage, unlike the permanent
+	// ErrPushDisabled.
+	ErrPushUnavailable = errors.New("sukko: push service is temporarily unavailable")
 )
 
 // CodeNotAvailable is the wire code the server sends when position-anchored
@@ -193,6 +210,25 @@ func (e *PublishError) Error() string {
 		return fmt.Sprintf("sukko: publish rejected: %s: %s", e.Code, e.Message)
 	}
 	return "sukko: publish rejected: " + e.Code
+}
+
+// PushError reports a server-side push rejection that has no more specific typed
+// mapping (an edition gate is *EditionRequiredError, an absent surface is
+// ErrPushDisabled, an outage is ErrPushUnavailable). It carries the gateway's
+// code so a caller can branch on the specific rejection.
+type PushError struct {
+	// Code is the gateway's push error code, e.g. "INVALID_REQUEST"; an
+	// HTTP_<status> synthetic when the body carried none.
+	Code string
+	// Message is the server's human-readable description, when present.
+	Message string
+}
+
+func (e *PushError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("sukko: push rejected: %s: %s", e.Code, e.Message)
+	}
+	return "sukko: push rejected: " + e.Code
 }
 
 // HistoryError reports a server-side history rejection. It carries the channel
