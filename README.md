@@ -110,6 +110,16 @@ Every failure is a typed Go error — sentinels matchable with `errors.Is` (`Err
 `ErrEditionRequired`, …) and typed structs via `errors.As` (`*RecoveryInterruptedError`,
 `*PayloadDecodeError`, `*CloseError`, …). Credentials never appear in an error string or log record.
 
+## Engineering
+
+- [Engineering principles](docs/engineering-principles.md) — the rules this SDK
+  is built and reviewed against. Code comments cite them by section: `// per §VI`
+  refers to section VI of that document (or of the
+  [platform principles](https://github.com/sukko-dev/sukko/blob/main/docs/engineering-principles.md)
+  it adapts — each heading carries the cross-reference).
+- [Architecture decision records](docs/adr/) — durable decisions with context
+  and rejected alternatives; comments cite them as `ADR-NNNN`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
