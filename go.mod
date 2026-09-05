@@ -1,4 +1,4 @@
-module github.com/klurvio/sukko-go
+module github.com/sukko-dev/sdk-go
 
 go 1.26.1
 

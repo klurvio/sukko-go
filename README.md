@@ -1,6 +1,6 @@
 # sukko-go
 
-Go client SDK for the [Sukko](https://github.com/klurvio/sukko) real-time platform — real-time
+Go client SDK for the [Sukko](https://github.com/sukko-dev/sukko) real-time platform — real-time
 market-data / event subscription for backend services, data pipelines, and edge consumers.
 
 - **Channel + iterator delivery** with inherent back-pressure — a bounded stream, no unbounded
@@ -14,11 +14,11 @@ market-data / event subscription for backend services, data pipelines, and edge 
 > 🚧 **Pre-release.** The API shown below is the target design; the implementation is in progress.
 > `go get` claims the module path, and symbols land as the SDK is built — so expect the surface to be
 > incomplete until `v0.1.0` is tagged. Design rationale lives in the package documentation and in the
-> commit history; the behavioural contract is the [AsyncAPI](https://github.com/klurvio/sukko) client
+> commit history; the behavioural contract is the [AsyncAPI](https://github.com/sukko-dev/sukko) client
 > protocol, which this SDK follows rather than any sibling SDK's current behaviour.
 
 ```bash
-go get github.com/klurvio/sukko-go
+go get github.com/sukko-dev/sdk-go
 ```
 
 Requires Go 1.23+.
@@ -32,7 +32,7 @@ import (
 	"context"
 	"log"
 
-	sukko "github.com/klurvio/sukko-go"
+	sukko "github.com/sukko-dev/sdk-go"
 )
 
 type Trade struct {

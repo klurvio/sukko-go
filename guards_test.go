@@ -39,7 +39,7 @@ func TestExactlyOneRuntimeDependency(t *testing.T) {
 	std := stdlibPackages(t)
 	external := map[string]bool{}
 	for pkg := range strings.FieldsSeq(string(out)) {
-		if pkg == "github.com/klurvio/sukko-go" || std[pkg] {
+		if pkg == "github.com/sukko-dev/sdk-go" || std[pkg] {
 			continue
 		}
 		// Reduce a package path to its module root for counting: the promise is
@@ -82,7 +82,7 @@ func TestNoPlatformRepoDependency(t *testing.T) {
 	}
 
 	for pkg := range strings.FieldsSeq(string(out)) {
-		if strings.Contains(pkg, "klurvio/sukko/") || pkg == "github.com/klurvio/sukko" {
+		if strings.Contains(pkg, "sukko-dev/sukko/") || pkg == "github.com/sukko-dev/sukko" {
 			t.Errorf("imports the platform module (%s); the SDK must derive behavior from the contracts alone", pkg)
 		}
 	}
